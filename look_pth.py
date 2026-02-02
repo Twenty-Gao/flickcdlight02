@@ -105,7 +105,6 @@ if __name__ == "__main__":
 
     # 👇 修改这里：你想保存的 txt 文件路径
     output_file_all = './model/stu24/backbone_only.txt'
-    output_file_all = './model/best_model.txt'
     output_file_all = './result/LEVIR_CD_Experiment_distillation17/checkpoint_epoch_200.txt'
     output_file_all = './result/LEVIR_CD_Experiment_distillation18/best_student_model.txt'
     output_file_all = './result/LEVIR_CD_Experiment_distillation19/best_student_model.txt'
@@ -123,7 +122,6 @@ if __name__ == "__main__":
 
     # 只查看backbone层信息
     output_file_backbone = './model/stu24/backbone_info_only.txt'
-    output_file_backbone = './model/backbone_info_only.txt'
     output_file_backbone = './result/LEVIR_CD_Experiment_distillation17/checkpoint_epoch_200_backbone_only.txt'
     output_file_backbone = './result/LEVIR_CD_Experiment_distillation18/best_student_model_backbone_only.txt'
     output_file_backbone = './result/LEVIR_CD_Experiment_distillation19/best_student_model_backbone_only.txt'

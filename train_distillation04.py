@@ -91,7 +91,8 @@ class Trainer(object):
             'relation_loss':[],
             'logit_loss':[],
             'learning_rate': [],
-            'vid_loss': []
+            'vid_loss': [],
+            'dino_loss': []
 
         }
         # Set model parameters
@@ -131,7 +132,7 @@ class Trainer(object):
             requires_grad=True
         )
 
-        # 2. [关键] 初始化 DIST Loss
+        # 2.初始化 DIST Loss
         # DIST Loss 也是一种特征对齐，通常不需要特别大的 alpha，但也取决于数值量级
         # 建议 distill_alpha 设置为 2.0 到 5.0 之间尝试
         # 这里实例化了你写的 DISTLoss 类，并放到 GPU 上
@@ -191,6 +192,15 @@ class Trainer(object):
         self.best_f1_train = 0.0
         self.best_epoch_train = 0
         self.start_epoch = 0
+        # 初始化 DINO Loss
+        if self.use_dino:
+            print(">>> Initializing DINO Loss...")
+            self.dino_loss_fn = DINOLoss(
+                out_dim=65536,
+                nepochs=args.epochs,
+                # warmup_teacher_temp=0.04,
+                # teacher_temp=0.07,
+            ).to(self.device)
 
     def calculate_distill_loss(self, s_feats_list, t_feats_list):
         """
@@ -280,6 +290,7 @@ class Trainer(object):
             epoch_relation = 0.0
             epoch_logit = 0.0
             epoch_vid = 0.0
+            epoch_dino = 0.0
 
             # 使用 tqdm 显示进度条
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {e + 1}/{self.epoch}")
@@ -333,6 +344,16 @@ class Trainer(object):
                 # loss_vid = loss_vid / (2 * num_scales)  # 取平均
                 # 2. Hard Loss (Ground Truth 监督)
                 # 使用 BCELoss 让输出掩码逼近 Ground Truth
+
+                # === 2. DINO Loss (自蒸馏) ===
+                loss_dino = torch.tensor(0.0).to(self.device)
+                if self.use_dino:
+                    student_out = outputs['student_dino']
+                    teacher_out = outputs['teacher_dino']
+
+                    # 计算 DINO Loss
+                    loss_dino = self.dino_loss_fn(student_out, teacher_out, e)
+
                 for m in masks:
                     loss_bce += bce_loss_fn(m, gt)
                     loss_dice += self.dice_loss_fn(m, gt)
@@ -372,13 +393,20 @@ class Trainer(object):
                 beta = 1.0  # <--- [新增] 关系损失的权重，建议设为 1.0 或 0.5
                 gamma = 1.0
                 # loss = loss_hard + alpha * loss_vid + beta * loss_relation+ gamma * loss_logit
-                loss = loss_hard + beta * loss_relation+ gamma * loss_logit
+                loss = loss_hard + beta * loss_relation+ gamma * loss_logit+alpha * loss_dino
 
 
                 # 5. 反向传播与优化
                 self.optim.zero_grad()# 清空梯度
                 loss.backward()# 计算梯度
                 self.optim.step()# 更新学生参数
+                # === 4. EMA 更新 Teacher ===
+                if self.use_dino:
+                    # 使用动量更新 teacher = m * teacher + (1-m) * student
+                    # m 通常从 0.996 增长到 1.0
+                    momentum = 0.996
+                    update_teacher_weights(self.model.student_backbone, self.model.teacher_backbone, momentum)
+                    update_teacher_weights(self.model.student_dino_head, self.model.teacher_dino_head, momentum)
 
                 # 记录和显示
                 epoch_loss_sum += loss.item()
@@ -394,6 +422,7 @@ class Trainer(object):
                     # 'VID': f"{loss_vid.item():.4f}",
                     'Relation': f"{loss_relation.item():.4f}",
                     'Logit': f"{loss_logit.item():.4f}",
+                    'Dino': f"{loss_dino.item():.4f}",
                 })
 
             # 计算当前 Epoch 的平均 Loss
@@ -402,6 +431,7 @@ class Trainer(object):
             avg_dist = epoch_dist / len(self.train_dataloader)
             avg_relation = epoch_relation / len(self.train_dataloader)
             avg_logit = epoch_logit / len(self.train_dataloader)
+            avg_dino = epoch_dino / len(self.train_dataloader)
             # avg_vid = epoch_vid / len(self.train_dataloader)
             # 记录训练历史
             self.train_history['epochs'].append(e + 1)
@@ -410,11 +440,12 @@ class Trainer(object):
             self.train_history['dist_loss'].append(avg_dist)
             self.train_history['relation_loss'].append(avg_relation)
             self.train_history['logit_loss'].append(avg_logit)
+            self.train_history['dino_loss'].append(avg_dino)
             # self.train_history['vid_loss'].append(avg_vid)
             self.train_history['learning_rate'].append(self.optim.param_groups[0]['lr'])
 
             # self.logger.info(f"Epoch {e+1}: Avg Loss={avg_loss:.5f} (Vid={avg_vid:.5f},Relation={avg_relation:.5f}, Hard={avg_hard:.5f}),logit={avg_logit:.5f}")
-            self.logger.info(f"Epoch {e+1}: Avg Loss={avg_loss:.5f} (Relation={avg_relation:.5f}, Hard={avg_hard:.5f}),logit={avg_logit:.5f}")
+            self.logger.info(f"Epoch {e+1}: Avg Loss={avg_loss:.5f} (Relation={avg_relation:.5f}, Hard={avg_hard:.5f}),logit={avg_logit:.5f},dino = {avg_dino:5f}")
             # 保存 Best Model 逻辑 ---
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
