@@ -1,11 +1,14 @@
-import torch
-from torch.optim.lr_scheduler import StepLR
+from werkzeug.debug.repr import missing
 
 from model.encoder_distillation03 import repvit_m0, repvit_m2_3, repVgg, lightVGG, LightVGG_Pro, repvit_student01, \
-    repvit_student02
+    repvit_student02, repvit_student03, repvit_m0_light, repvit_m0_lighter
 from timm.models.layers import SqueezeExcite, trunc_normal_
 from torch import nn
 import torch.nn.functional as F
+import copy
+from dino_utils import DINOHead
+import torch
+from dist_loss import VIDBlock
 
 #实现了局部窗口自注意力机制（SWSA），在固定大小的图像块内计算注意力
 class PatchSA(nn.Module):
@@ -263,54 +266,210 @@ def load_pretrained_model(model):
 # decoder_distillation02.py (部分代码，请替换原来的 FlickCD 类)
 
 class FlickCD(nn.Module):
-    def __init__(self, window_size: tuple, stride: tuple, load_pretrained=True, distillation=False):
+    def __init__(self, window_size: tuple, stride: tuple, load_pretrained=True, distillation=False,use_dino=False):
         super(FlickCD, self).__init__()
+        self.use_dino = use_dino
         assert len(window_size) == 3 and len(stride) == 3
 
-        # 1. 初始化教师模型
-        self.teacher_backbone = repvit_m0()
-        # 4. 创建学生模型 (RepViT-Student)
+        # --- 1. 学生模型组件 (核心) ---
+        self.dim = 80
+        # 你的学生 Backbone (根据你的实际选择修改这里，例如 repvit_student02)
         self.student_backbone = repvit_student02()
         # self.student_backbone = repvit_m0()
         # self.student_backbone = repvit_student03()
         # self.student_backbone = repvit_m0_light()
         # self.student_backbone = repvit_m0_lighter()
 
-
-        # --- 多尺度适配层 & 解码器 ---
-        self.dim = 80
+        # 变化检测头 (UCM + Decoder)
         self.ucm = EnhancedDiffModule([40, 80, 160], self.dim)
         self.decoder = Decoder(self.dim, window_size, stride)
 
+        # --- 2. 教师模型组件 (仅蒸馏模式下需要) ---
+        self.distillation = distillation
+        if self.distillation:
+            self.teacher_backbone = repvit_m0()
+            self.teacher_ucm = EnhancedDiffModule([40, 80, 160], self.dim)
+            self.teacher_decoder = Decoder(self.dim, window_size, stride)
+
+            # 冻结 Teacher
+            for p in self.teacher_backbone.parameters(): p.requires_grad = False
+            for p in self.teacher_ucm.parameters(): p.requires_grad = False
+            for p in self.teacher_decoder.parameters(): p.requires_grad = False
+
+            # === 初始化 VID 模块 ===
+            # 我们要对 backbone 输出的特征进行蒸馏
+            # repvit_student02 输出通道: [40, 80, 160]
+            s_channels = [40, 80, 160]
+            # repvit_m0 输出通道: [40, 80, 160]
+            t_channels = [40, 80, 160]
+
+            self.vid_blocks = nn.ModuleList([
+                VIDBlock(s_c, t_c) for s_c, t_c in zip(s_channels, t_channels)
+            ])
+            print(">>> VID Distillation Modules Initialized.")
         # 2. 加载教师权重
-        if load_pretrained:
-            # 这里的路径请根据你的实际情况确认，如果是 best_model.pth 请确保里面包含 teacher 权重
-            # self._load_teacher_weights('./model/best_model.pth')
-            # self._load_teacher_weights('./model/SYSU_best_model.pth')
-            # self._load_teacher_weights('./model/CDD_best_model.pth')
-            self._load_teacher_weights('./model/WHU_best_model.pth')
+        if load_pretrained and not use_dino:
+            # 权重初始化
+            self._load_teacher_weights('./model/best_model.pth')
+            # self._load_teacher_weights('./model/WHU_best_model.pth')
             # 执行权重继承 (Student 继承 Teacher)
             self._inherit_student_weights()
 
-            # 3. 冻结教师模型
-        for param in self.teacher_backbone.parameters():
-            param.requires_grad = False
-        self.teacher_backbone.eval()
-        # # [B] 冻结 UCM (新增)
-        # print("Freezing UCM...")
-        # for param in self.ucm.parameters():
-        #     param.requires_grad = False
-        # self.ucm.eval()  # 确保 BN 层使用预训练的统计值
-        #
-        # # [C] 冻结 Decoder (新增)
-        # print("Freezing Decoder...")
-        # for param in self.decoder.parameters():
-        #     param.requires_grad = False
-        # self.decoder.eval()  # 确保 BN 层使用预训练的统计值
-        #
-        # # 此时，只有 self.student_backbone 的 requires_grad 为 True
-        # print(">>> Model Setup: Only Student Backbone is trainable.")
 
+
+    def forward(self, t1, t2, return_all=False, batch_idx=0, save_dir="./result_image/vis_results"):
+        # --- 1. 学生前向 ---
+        # print(batch_idx)
+        s1_feats = list(self.student_backbone(t1))
+        s2_feats = list(self.student_backbone(t2))
+
+        # --- 2. 学生变化检测解码 ---
+        stage1, stage2, stage3 = self.ucm(s1_feats[0], s1_feats[1], s1_feats[2],
+                                          s2_feats[0], s2_feats[1], s2_feats[2])
+        mask1, mask2, mask3 = self.decoder(stage1, stage2, stage3)
+
+        if hasattr(self, 'teacher_backbone'):
+            with torch.no_grad():
+                # 1. 显式运行 Teacher 推理
+                t1_feats = list(self.teacher_backbone(t1))
+                t2_feats = list(self.teacher_backbone(t2))
+
+                t_stage1, t_stage2, t_stage3 = self.teacher_ucm(
+                    t1_feats[0], t1_feats[1], t1_feats[2],
+                    t2_feats[0], t2_feats[1], t2_feats[2]
+                )
+                t_mask1, t_mask2, t_mask3 = self.teacher_decoder(t_stage1, t_stage2, t_stage3)
+
+        # =========== [可视化模块：同时保存学生和老师] ===========
+        # 仅在5个batch执行
+        if batch_idx < 5:
+            print(f"[DEBUG] 执行可视化，batch_idx={batch_idx}")
+            # --- A. 画学生 (Student) ---
+            stages = [stage1, stage2, stage3]
+            masks = [mask1, mask2, mask3]
+            for i in range(3):
+                self.visualize_6_col(
+                    t1, t2,
+                    s1_feats[i],  # Student T1 Feat
+                    s2_feats[i],  # Student T2 Feat
+                    stages[i],  # Student Stage
+                    masks[i],  # Student Pred (Mask)
+                    save_name=f"vis_batch_{batch_idx}_stage{i + 1}_STUDENT.png",
+                    save_dir=save_dir
+                )
+
+            # --- B. 画老师 (Teacher) ---
+            if hasattr(self, 'teacher_backbone'):
+                with torch.no_grad():
+                    t_stages = [t_stage1, t_stage2, t_stage3]
+                    t_masks = [t_mask1, t_mask2, t_mask3]
+
+                    for i in range(3):
+                        self.visualize_6_col(
+                            t1, t2,
+                            t1_feats[i],  # Teacher T1 Feat
+                            t2_feats[i],  # Teacher T2 Feat
+                            t_stages[i],  # Teacher Stage
+                            t_masks[i],  # Teacher Pred (Mask)
+                            save_name=f"vis_batch_{batch_idx}_stage{i + 1}_TEACHER.png",
+                            save_dir=save_dir
+                        )
+
+
+        # 如果只是普通推理 (测试/验证)，直接返回结果
+        if not return_all:
+            # 上采样到原图大小
+            mask1 = F.interpolate(mask1, scale_factor=4, mode='bilinear')
+            mask2 = F.interpolate(mask2, scale_factor=8, mode='bilinear')
+            mask3 = F.interpolate(mask3, scale_factor=16, mode='bilinear')
+            return torch.sigmoid(mask1), torch.sigmoid(mask2), torch.sigmoid(mask3)
+
+        #训练时的蒸馏逻辑 (仅在 return_all=True 时运行)
+        if return_all and hasattr(self, 'teacher_backbone'):
+
+            # 再次上采样 mask
+            mask1 = F.interpolate(mask1, scale_factor=4, mode='bilinear')
+            mask2 = F.interpolate(mask2, scale_factor=8, mode='bilinear')
+            mask3 = F.interpolate(mask3, scale_factor=16, mode='bilinear')
+
+            return {
+                'masks': [mask1, mask2, mask3],
+                's_feats': s1_feats + s2_feats,
+                't_feats': t1_feats + t2_feats,
+                's_stages': [stage1, stage2, stage3],
+                't_stages': [t_stage1, t_stage2, t_stage3],
+                't_masks': [t_mask1, t_mask2, t_mask3]
+            }
+
+        return torch.sigmoid(mask1), torch.sigmoid(mask2), torch.sigmoid(mask3)
+
+
+        # 添加到 FlickCD 类中
+    def visualize_6_col(self, t1, t2, feat1, feat2, diff, pred, save_name, save_dir="./vis_results"):
+            """
+            生成 6 列对比图：T1 | T2 | Feat1 | Feat2 | Diff | Mask
+            """
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import os
+            import cv2
+
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+
+            # === 辅助函数 (保持不变) ===
+            def tensor_to_img(t, mode='rgb'):
+                img = t[0].detach().cpu()
+                if mode == 'rgb':
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img = img * std + mean
+                    img = torch.clamp(img, 0, 1)
+                    img = img.permute(1, 2, 0).numpy()
+                    return img
+                elif mode == 'heatmap':
+                    if img.dim() == 3: img = torch.mean(img, dim=0)
+                    img = img.numpy()
+                    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                    img = np.uint8(255 * img)
+                    heatmap = cv2.applyColorMap(img, cv2.COLORMAP_JET)
+                    return cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+                elif mode == 'mask':
+                    if img.dim() == 3: img = img[0]
+                    img = torch.sigmoid(img).numpy()
+                    img = np.uint8(255 * img)
+                    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+            # 1. 转换数据
+            img_t1 = tensor_to_img(t1, mode='rgb')
+            img_t2 = tensor_to_img(t2, mode='rgb')
+            img_feat1 = tensor_to_img(feat1, mode='heatmap')  # T1 特征
+            img_feat2 = tensor_to_img(feat2, mode='heatmap')  # T2 特征 (新增)
+            img_diff = tensor_to_img(diff, mode='heatmap')
+            img_pred = tensor_to_img(pred, mode='mask')
+
+            # 2. 统一尺寸
+            h, w = img_t1.shape[:2]
+            img_t2 = cv2.resize(img_t2, (w, h))
+            img_feat1 = cv2.resize(img_feat1, (w, h))
+            img_feat2 = cv2.resize(img_feat2, (w, h))
+            img_diff = cv2.resize(img_diff, (w, h))
+            img_pred = cv2.resize(img_pred, (w, h))
+
+            # 3. 绘图 (1行6列)
+            fig, axes = plt.subplots(1, 6, figsize=(30, 5))  # 宽度增加到 30
+
+            titles = ["Pre (T1)", "Post (T2)", "Feat (T1)", "Feat (T2)", "Diff (Stage)", "Pred (Mask)"]
+            images = [img_t1, img_t2, img_feat1, img_feat2, img_diff, img_pred]
+
+            for ax, img, title in zip(axes, images, titles):
+                ax.imshow(img)
+                ax.set_title(title)
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, save_name))
+            plt.close()
 
 
     def _inherit_student_weights(self):
@@ -349,50 +508,10 @@ class FlickCD(nn.Module):
 
         # 加载回模型
         self.student_backbone.load_state_dict(s_state)
-        print(f">>> [Weight Inheritance] 手术成功！Student 继承了 {inherited_count} 层权重 (跳过 {skipped_count} 层)。")
+        print(f">>> [Weight Inheritance] 成功！Student 继承了 {inherited_count} 层权重 (跳过 {skipped_count} 层)。")
         print(f">>> Student 现在拥有了和 Teacher 一样的初始视力，可以开始训练了。")
 
-    def forward(self, t1, t2, return_all=False):
-        # ... (保持原有的 forward 代码不变) ...
-        # --- 1. 教师前向 ---
-        t1_feats_list = []
-        t2_feats_list = []
-
-        if return_all:
-            with torch.no_grad():
-                t1_feats_raw = self.teacher_backbone(t1)
-                t2_feats_raw = self.teacher_backbone(t2)
-                t1_feats_list = t1_feats_raw
-                t2_feats_list = t2_feats_raw
-
-        # --- 2. 学生前向 ---
-        s1_feats = list(self.student_backbone(t1))
-        s2_feats = list(self.student_backbone(t2))
-
-        # --- 3. 变化检测解码 ---
-        stage1, stage2, stage3 = self.ucm(s1_feats[0], s1_feats[1], s1_feats[2],
-                                          s2_feats[0], s2_feats[1], s2_feats[2])
-        mask1, mask2, mask3 = self.decoder(stage1, stage2, stage3)
-
-        mask1 = F.interpolate(mask1, scale_factor=4, mode='bilinear')
-        mask2 = F.interpolate(mask2, scale_factor=8, mode='bilinear')
-        mask3 = F.interpolate(mask3, scale_factor=16, mode='bilinear')
-
-        # --- 4. 返回结果 ---
-        if return_all:
-            return {
-                'teacher_features_t1': t1_feats_list,
-                'teacher_features_t2': t2_feats_list,
-                'student_features_t1': s1_feats,
-                'student_features_t2': s2_feats,
-                'masks': [mask1, mask2, mask3]
-            }
-        else:
-            return torch.sigmoid(mask1), torch.sigmoid(mask2), torch.sigmoid(mask3)
-
-
     def _load_teacher_weights(self, path):
-        # ... (保持你原来写好的加载代码不变) ...
         print(f"Loading teacher weights from {path}...")
         try:
             checkpoint = torch.load(path, map_location='cpu', weights_only=False)
@@ -400,10 +519,13 @@ class FlickCD(nn.Module):
 
             # 1. 准备给 Teacher Backbone 的权重 (保持不变)
             backbone_weights = {}
+            backbone_loaded_count = 0
 
             # 2. 准备给 UCM 和 Decoder 的权重 (新增)
             ucm_weights = {}
             decoder_weights = {}
+            ucm_loaded_count = 0
+            decoder_loaded_count = 0
 
             for key, value in state_dict.items():
                 # 处理 Backbone
@@ -413,30 +535,43 @@ class FlickCD(nn.Module):
                 elif key.startswith('features.'):
                     backbone_weights[key] = value
 
-                # [新增] 处理 UCM
+                # 处理 UCM
                 elif key.startswith('ucm.'):
                     new_key = key.replace('ucm.', '')  # 去掉前缀以便加载
                     ucm_weights[new_key] = value
 
-                # [新增] 处理 Decoder
+                # 处理 Decoder
                 elif key.startswith('decoder.'):
                     new_key = key.replace('decoder.', '')
                     decoder_weights[new_key] = value
 
             # 加载 Teacher Backbone
             if len(backbone_weights) > 0:
-                self.teacher_backbone.load_state_dict(backbone_weights, strict=False)
-                print("Teacher Backbone loaded.")
+                missing_keys = self.teacher_backbone.load_state_dict(backbone_weights, strict=False)
+                backbone_loaded_count = len(backbone_weights)-len(missing_keys)
+                print(f"Teacher Backbone loaded: {backbone_loaded_count} weights，missing_keys:{missing_keys}")
 
-            # [新增] 加载 Student 的 UCM 和 Decoder
-            # 注意：这里是加载到 self.ucm 和 self.decoder (它们属于 Student 流)
             if len(ucm_weights) > 0:
-                self.ucm.load_state_dict(ucm_weights, strict=True)
-                print("Student UCM initialized from pretrained weights.")
+                missing_keys, unexpected_keys = self.teacher_ucm.load_state_dict(ucm_weights, strict=True)
+                ucm_loaded_count = len(ucm_weights) - len(missing_keys)
+                print(f"Teacher UCM initialized from pretrained weights: {ucm_loaded_count} weights,missing_keys:{missing_keys}")
 
             if len(decoder_weights) > 0:
-                self.decoder.load_state_dict(decoder_weights, strict=True)
-                print("Student Decoder initialized from pretrained weights.")
+                missing_keys, unexpected_keys = self.teacher_decoder.load_state_dict(decoder_weights, strict=True)
+                decoder_loaded_count = len(decoder_weights) - len(missing_keys)
+                print(f"Teacher Decoder initialized from pretrained weights: {decoder_loaded_count} weights,missing_keys{missing_keys}")
+
+            # 加载 Student 的 UCM 和 Decoder
+            # 注意：这里是加载到 self.ucm 和 self.decoder (它们属于 Student 流)
+            if len(ucm_weights) > 0:
+                missing_keys, unexpected_keys = self.ucm.load_state_dict(ucm_weights, strict=True)
+                ucm_loaded_count = len(ucm_weights) - len(missing_keys)
+                print(f"Student UCM initialized from pretrained weights: {ucm_loaded_count} weights,missing_keys{missing_keys}")
+
+            if len(decoder_weights) > 0:
+                missing_keys, unexpected_keys = self.decoder.load_state_dict(decoder_weights, strict=True)
+                decoder_loaded_count = len(decoder_weights) - len(missing_keys)
+                print(f"Student Decoder initialized from pretrained weights: {decoder_loaded_count} weights,missing_keys{missing_keys}")
 
         except Exception as e:
             print(f"Error loading checkpoint: {e}")

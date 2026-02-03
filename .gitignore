@@ -3,8 +3,6 @@
 *.pth
 *.pt
 *.h5
-data/
-models/
-checkpoints/
 __pycache__/
 *.pyc
+/result/

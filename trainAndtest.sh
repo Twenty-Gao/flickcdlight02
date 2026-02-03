@@ -87,9 +87,9 @@ python train.py \
     --epochs 500\
     --resume "./result/LEVIR_CD_Experiment_distillation49/checkpoint_epoch_150.pth"
 
-    python train_distillation04.py \
+    python train_distillation03.py \
     --mode train \
-    --title "LEVIR_CD_Experiment_distillation51" \
+    --title "LEVIR_CD_Experiment_distillation52" \
     --data_name "LEVIR+" \
     --train_dataset_path "../../Dataset/LEVIR-CD+/train/" \
     --train_list_path "../../Dataset/LEVIR-CD+/train.txt" \

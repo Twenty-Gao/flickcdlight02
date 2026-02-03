@@ -5,15 +5,23 @@ import argparse
 import numpy as np
 import torch.optim as optim
 import torch.nn.functional as F
+
+import torch.nn as nn
 import Transforms as myTransforms
 from torch.utils.data import DataLoader
 from model.decoder_distillation03 import FlickCD
 from loadData import makeDataset
+from conver_stu import convert_checkpoint
+from dino_utils import DINOLoss, update_teacher_weights
 from tqdm import tqdm
-# ... 其他 import ...
-from utils import get_logger, Evaluator
-from conver_stu import convert_checkpoint  # <--- 新增这行，确保 conver_stu.py 在同一目录下
+from utils import get_logger, Evaluator, visualize_distillation_details
+
+from dist_loss import DISTLoss
+
 '''
+
+        使用Dist 对 flickCD 的 backbone 进行蒸馏
+
 此代码为使用 soft和hard loss
 损失函数的计算：
     1.特征蒸馏损失（soft loss） ：这是让学生模型教师的部分
@@ -36,11 +44,36 @@ from conver_stu import convert_checkpoint  # <--- 新增这行，确保 conver_s
         alpha 控制了蒸馏的比重。
 
 '''
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        # logits: [B, 1, H, W], targets: [B, 1, H, W]
+        preds = torch.sigmoid(logits)
+
+        # 展平 保持Batch维度不变  [B, H*W]
+        preds = preds.view(preds.size(0), -1)
+        targets = targets.view(targets.size(0), -1)
+
+        # 计算交集
+        intersection = (preds * targets).sum(1)
+        # 计算总和 ： 预测图中所有概率值的总和  真实标签中所有1的综合
+        union = preds.sum(1) + targets.sum(1)
+
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice.mean()
+
+
 def Cal_loss(output, target):
     loss_res = 0
     for res in output:
         loss_res += F.binary_cross_entropy(res, target)
     return loss_res
+
 
 class Trainer(object):
     def __init__(self, args):
@@ -50,12 +83,23 @@ class Trainer(object):
         self.TITLE = args.title
         self.evaluator = Evaluator(num_class=2)
         self.evaluator_train = Evaluator(num_class=2)
-        # 初始化最佳 Loss 为无穷大
         self.best_loss = float('inf')
+        # 用于记录训练历史的列表
+        self.train_history = {
+            'epochs': [],
+            'avg_loss': [],
+            'hard_loss': [],
+            'dist_loss': [],
+            'relation_loss': [],
+            'logit_loss': [],
+            'learning_rate': [],
+            'vid_loss': [],
+            'dino_loss': []
 
+        }
         # Set model parameters
-        window_size=None
-        stride=None
+        window_size = None
+        stride = None
         load_pretrained = False
         if args.data_name in ['SYSU', 'CDD']:
             window_size = (8, 8, 16)
@@ -69,14 +113,32 @@ class Trainer(object):
         if args.mode == 'train':
             load_pretrained = True
 
-        #打印window_size
-        # 替换为：
+        # 增加 DINO 相关的参数
+        self.use_dino = getattr(args, 'use_dino', False)  # 记得在 main函数 argparse 加这个参数
+
+        # 1. 初始化模型
         print('Window size: ' + str(window_size))
-        self.model = FlickCD(window_size, stride, load_pretrained)
-
-
+        # 确保 args.use_distillation 被传入
+        # 注意：如果你希望训练时默认开启蒸馏，这里也可以直接传 distillation=True
+        self.model = FlickCD(window_size, stride, load_pretrained,
+                             distillation=True,
+                             use_dino=self.use_dino)
         self.model = self.model.to(self.device)
 
+        # 1. 定义可学习的权重参数
+        # 初始化为 log 空间的值，或者直接初始化。这里我们保留你的偏好趋势，但允许它变动。
+        # requires_grad=True 是关键
+        self.learnable_weights = torch.nn.Parameter(
+            torch.tensor([0.1, 0.2, 0.7], dtype=torch.float32, device=self.device),
+            requires_grad=True
+        )
+
+        # 2.初始化 DIST Loss
+        # DIST Loss 也是一种特征对齐，通常不需要特别大的 alpha，但也取决于数值量级
+        # 建议 distill_alpha 设置为 2.0 到 5.0 之间尝试
+        # 这里实例化了你写的 DISTLoss 类，并放到 GPU 上
+        self.dist_loss_fn = DISTLoss(beta=1.0, gamma=2.0).to(self.device)
+        self.dice_loss_fn = DiceLoss().to(self.device)
         self.model_save_path = args.savedir + self.TITLE
         self.log_dir = self.model_save_path + '/Logs/'
 
@@ -90,7 +152,11 @@ class Trainer(object):
 
         self.lr = args.learning_rate
         self.epoch = args.epochs
-        self.optim = optim.AdamW(self.model.parameters(), self.lr, weight_decay=args.weight_decay)
+        # 我们需要把 model 的参数 和 新定义的 learnable_weights 一起传进去
+        self.optim = optim.AdamW([
+            {'params': self.model.parameters()},  # 模型本身的参数
+            {'params': [self.learnable_weights], 'lr': 1e-3}  # 权重参数 (建议给这几个参数单独设一个较小的 lr，防止变动太剧烈)
+        ], lr=self.lr, weight_decay=args.weight_decay)
 
         mean = [0.406, 0.456, 0.485, 0.406, 0.456, 0.485]
         std = [0.225, 0.224, 0.229, 0.225, 0.224, 0.229]
@@ -111,99 +177,97 @@ class Trainer(object):
             myTransforms.ToTensor(),
         ])
 
+        # 3. 数据增强与加载器 (DataLoader)
         generator = torch.Generator().manual_seed(args.seed)
         self.train_dataset = makeDataset(self.args.train_dataset_path, self.args.train_name_list, self.trainTransform)
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True, generator=generator, num_workers=16, drop_last=False)
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True,
+                                           generator=generator, num_workers=16, drop_last=False)
 
         self.val_dataset = makeDataset(self.args.val_dataset_path, self.args.val_name_list, self.valTransform)
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.args.batch_size, num_workers=16, drop_last=False)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.args.batch_size, num_workers=16,
+                                         drop_last=False)
 
         self.test_dataset = makeDataset(self.args.test_dataset_path, self.args.test_name_list, self.valTransform)
-        self.test_dataloader = DataLoader(self.test_dataset, batch_size=self.args.batch_size, num_workers=16, drop_last=False)
+        self.test_dataloader = DataLoader(self.test_dataset, batch_size=self.args.batch_size, num_workers=16,
+                                          drop_last=False)
 
         self.best_f1 = 0.0
         self.best_epoch = 0
         self.best_f1_train = 0.0
         self.best_epoch_train = 0
         self.start_epoch = 0
+        # 初始化 DINO Loss
+        if self.use_dino:
+            print(">>> Initializing DINO Loss...")
+            self.dino_loss_fn = DINOLoss(
+                out_dim=65536,
+                nepochs=args.epochs,
+                # warmup_teacher_temp=0.04,
+                # teacher_temp=0.07,
+            ).to(self.device)
 
+    def calculate_distill_loss(self, s_feats_list, t_feats_list):
+        """
+        计算多尺度 DIST Loss
+        """
+        loss_dist_total = 0.0
+        num_scales = len(s_feats_list)
 
-        # 修改前
-        # def dist_loss(self, s, t):
-        #     s_norm = F.normalize(s, dim=1)
-        #     t_norm = F.normalize(t, dim=1)
-        #     return F.mse_loss(s_norm, t_norm)
-        # 在 Trainer 类中添加这个方法
-
-    def calculate_distill_loss(self, s_feats, t_feats, epoch, warmup_epochs=20):
-        loss_distill = 0.0
-        num_scales = len(s_feats)
-        # 深层特征权重更大，或者你可以改成 [1,1,1]
-        scale_weights = [0.2, 0.3, 0.5]
+        # 1. 对可学习参数进行 Softmax，确保它们和为 1 且为正
+        # 这样模型就在学习“分配比例”
+        current_weights = F.softmax(self.learnable_weights, dim=0)
+        # 打印一下当前的权重，方便你观察训练过程中权重的变化（可选）
+        # print(f"Current Distill Weights: {current_weights.detach().cpu().numpy()}")
+        # [修复逻辑] 自动扩展权重
+        # 因为 s_feats_list 包含了 T1 和 T2 两张图的特征 (3 + 3 = 6)
+        # 所以我们需要把权重复制一份：[0.2, 0.3, 0.5, 0.2, 0.3, 0.5]
+        # 2. 逻辑适配：因为你有双时相 (T1, T2) 共 6 层，需要把权重复制一份
+        if num_scales == 2 * len(current_weights):
+            # 变成 [w0, w1, w2, w0, w1, w2]
+            scale_weights = torch.cat([current_weights, current_weights], dim=0)
+        elif num_scales == len(current_weights):
+            scale_weights = current_weights
+        else:
+            # 兜底逻辑
+            scale_weights = current_weights
 
         for i in range(num_scales):
-            s = s_feats[i]
-            t = t_feats[i]
+            s_f = s_feats_list[i]
+            t_f = t_feats_list[i]
 
-            # 检查通道数是否一致。如果不一致（例如学生通道少），需要用 1x1 卷积对齐
-            # 假设你目前的架构输出通道是一样的，或者是通过 Adapter 对齐过的
+            loss_layer = self.dist_loss_fn(s_f, t_f)
 
-            if epoch < warmup_epochs:
-                # 【阶段一：纯 MSE】学习强度 + 方向
-                # 直接计算 MSE，不归一化。
-                # 乘以一个系数（如 10 或 100）是因为特征图的值通常很小
-                loss_layer = F.mse_loss(s, t) * 100.0
-            else:
-                # 【阶段二：归一化 MSE】精调方向
-                s_norm = F.normalize(s, p=2, dim=1)
-                t_norm = F.normalize(t, p=2, dim=1)
-                loss_layer = F.mse_loss(s_norm, t_norm) * 10.0  # 归一化后值变小了，可能需要调整系数
+            # 累加加权 Loss
+            loss_dist_total += loss_layer * scale_weights[i]
 
-            loss_distill += loss_layer * scale_weights[i]
-
-        return loss_distill
-        # 修改后
-
-    def dist_loss(self, s, t, epoch, warmup_epochs=5):
-        """
-        前 warmup_epochs 轮使用纯 MSE，让学生先学会数值范围，避免噪声被放大。
-        之后切换为归一化 MSE (Cosine)，让学生学习特征分布。
-        """
-        if epoch < warmup_epochs:
-            # 【热身阶段】纯 MSE
-            # 注意：RepViT 的特征数值可能比较小，MSE 可能会很小，
-            # 如果发现 Loss 变成了 0.0000x，可以手动乘一个系数，比如 * 100
-            return F.mse_loss(s, t) * 100.0
-        else:
-            # 【正式阶段】归一化 MSE (关注方向/纹理)
-            s_norm = F.normalize(s, dim=1)
-            t_norm = F.normalize(t, dim=1)
-            return F.mse_loss(s_norm, t_norm)
+        # 返回平均 Loss
+        return loss_dist_total / num_scales
 
     def training(self):
         # 打印训练方法名
-        # self.logger.info('Net: ' + self.TITLE)
         self.logger.info('Starting Encoder Distillation for: ' + self.TITLE)
 
         # 定义损失函数
-        mse_loss_fn = torch.nn.MSELoss()  # 用于特征蒸馏
         bce_loss_fn = torch.nn.BCEWithLogitsLoss()  # 用于任务监督
-
-        alpha = self.args.distill_alpha
-
 
         if self.args.resume is None:
             self.args.resume = self.model_save_path + '/checkpoint.pth.tar'
         if os.path.isfile(self.args.resume):
             print("=> loading checkpoint '{}'".format(self.args.resume))
             checkpoint = torch.load(self.args.resume)
+
             self.start_epoch = checkpoint['epoch']
-            self.best_f1 = checkpoint['best_f1']
-            self.best_epoch = checkpoint['best_epoch']
-            self.best_f1_train = checkpoint['best_f1_train']
-            self.best_epoch_train = checkpoint['best_epoch_train']
+
+            self.best_loss = checkpoint.get('best_loss', float('inf'))
+            self.best_f1 = checkpoint.get('best_f1', 0.0)
+            self.best_epoch = checkpoint.get('best_epoch', 0)
+            # 对于 train 的指标也做同样处理，防止报错
+            self.best_f1_train = checkpoint.get('best_f1_train', 0.0)
+            self.best_epoch_train = checkpoint.get('best_epoch_train', 0)
+
             self.model.load_state_dict(checkpoint['state_dict'])
             self.optim.load_state_dict(checkpoint['optimizer'])
+
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(self.args.resume, checkpoint['epoch']))
         else:
@@ -213,102 +277,174 @@ class Trainer(object):
 
         # 从起始轮次开始训练到指定轮次
         for e in range(self.start_epoch, self.epoch):
-            self.model.train()  # 确保学生模型和Adapter处于训练模式
-            # 再次强制教师模型为评估模式 (双重保险)
-            self.model.teacher_backbone.eval()
+            self.model.train()
+            # 确保教师是 Eval 模式
+            if hasattr(self.model, 'teacher_backbone'):
+                self.model.teacher_backbone.eval()
 
+            # 初始化记录变量
             epoch_loss_sum = 0.0
-            epoch_soft = 0.0
+            epoch_dist = 0.0
             epoch_hard = 0.0
+            epoch_relation = 0.0
+            epoch_logit = 0.0
+            epoch_vid = 0.0
+            epoch_dino = 0.0
 
             # 使用 tqdm 显示进度条
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {e + 1}/{self.epoch}")
-
+            # Batch 循环
             for iter, data in enumerate(progress_bar):
                 pre_img, post_img, gt, data_idx = data
                 pre_img = pre_img.to(self.device).float()
                 post_img = post_img.to(self.device).float()
-                gt = gt.to(self.device).float().unsqueeze(1)# [B, 1, H, W]
+                gt = gt.to(self.device).float().unsqueeze(1)  # [B, 1, H, W]
 
+                # 1. 前向传播 (获取特征)
+                outputs = self.model(pre_img, post_img,return_all=True, batch_idx = iter,save_dir="./result_image/vis_results")
+                masks = outputs['masks']  # 用于算 Hard Loss
+                s_feats = outputs['s_feats']
+                t_feats = outputs['t_feats']
+                t_masks = outputs['t_masks']
+                loss_bce = 0.0
+                loss_dice = 0.0
 
-                # === 前向传播 (return_all=True) ===
-                # 这里会同时拿到特征和掩码
-                outputs = self.model(pre_img, post_img, return_all=True)
-
-                s_feats_t1 = outputs['student_features_t1']  # [S1, S2, S3]
-                t_feats_t1 = outputs['teacher_features_t1']  # [T1, T2, T3]
-                s_feats_t2 = outputs['student_features_t2']
-                t_feats_t2 = outputs['teacher_features_t2']
-
-                masks = outputs['masks']
-
-
-                # === 1. 计算 Multi-Scale Soft Loss ===
-                loss_soft_val = 0.0
-
-                # 确保学生和教师特征层数一致
-                num_scales = len(s_feats_t1)
-
-                # 你可以为不同尺度设置权重，例如深层特征更重要：[0.2, 0.3, 0.5]
-                # 这里暂时使用平均权重
-                scale_weights = [0.2, 0.3, 0.5]
-
-                for i in range(num_scales):
-                    # T1 时刻
-                    s_norm_t1 = F.normalize(s_feats_t1[i], p=2, dim=1, eps=1e-8)
-                    t_norm_t1 = F.normalize(t_feats_t1[i], p=2, dim=1, eps=1e-8)
-                    loss_layer_t1 = mse_loss_fn(s_norm_t1, t_norm_t1)
-
-                    # T2 时刻
-                    s_norm_t2 = F.normalize(s_feats_t2[i], p=2, dim=1, eps=1e-8)
-                    t_norm_t2 = F.normalize(t_feats_t2[i], p=2, dim=1, eps=1e-8)
-                    loss_layer_t2 = mse_loss_fn(s_norm_t2, t_norm_t2)
-
-                    # 累加当前尺度的 Loss
-                    loss_soft_val += (loss_layer_t1 + loss_layer_t2) * scale_weights[i]
-
-                # 取平均并放大，保持量级
-                loss_soft = (loss_soft_val / num_scales) * 100.0
+                # loss_vid = 0.0
+                # # 这里是三个尺度的特征图
+                # num_scales = len(self.model.vid_blocks)
                 #
-                # soft loss 法2
-                # loss_soft_val = 0.0
-                # # 计算 T1 时刻蒸馏
-                # loss_soft_val += self.calculate_distill_loss(s_feats_t1, t_feats_t1, e)
-                # # 计算 T2 时刻蒸馏
-                # loss_soft_val += self.calculate_distill_loss(s_feats_t2, t_feats_t2, e)
+                # # 在每50个epoch的第0个batch保存可视化
+                # save_vis = (e%10==0) and (iter==0)
                 #
-                # loss_soft = loss_soft_val / 2.0  # 取平均
+                # # 处理 T1 特征
+                # for i in range(num_scales):
+                #     if save_vis:
+                #         res_dict = self.model.vid_blocks[i](s_feats[i], t_feats[i],return_details = True)
+                #         loss_vid = res_dict['loss']
+                #
+                #         loss_rel_dummy, sim_s, sim_t = self.dist_loss_fn.forward_relation(s_feats[i], t_feats[i],
+                #                                                                       return_details=True)
+                #         visualize_distillation_details(
+                #             save_dir=os.path.join(self.model_save_path, 'result/vis_matrices'),
+                #             batch_idx=iter,
+                #             epoch_id = e,
+                #             scale_idx=i,  # 第 i 个尺度
+                #             vid_data=res_dict,
+                #             relation_data={'sim_s': sim_s, 'sim_t': sim_t}
+                #         )
+                #     else:
+                #          # 正常训练
+                #         loss_vid += self.model.vid_blocks[i](s_feats[i], t_feats[i])
+                # # 处理 T2 特征 (索引偏移 num_scales)
+                # for i in range(num_scales):
+                #     loss_vid += self.model.vid_blocks[i](s_feats[i + num_scales], t_feats[i + num_scales])
+                #
+                # loss_vid = loss_vid / (2 * num_scales)  # 取平均
+                # 2. Hard Loss (Ground Truth 监督)
+                # 使用 BCELoss 让输出掩码逼近 Ground Truth
 
-                # === 2. 计算 Hard Loss (任务监督) ===
-                # 对解码器输出的三个尺度掩码都计算 Loss
-                loss_hard = 0.0
-                loss_hard += bce_loss_fn(masks[0], gt)  # mask1 (原图尺寸)
-                # 如果 gt 需要下采样匹配 mask2, mask3，则使用 F.interpolate
-                # 但你的 Decoder 输出已经上采样回原图尺寸，所以直接和 gt 计算即可
-                loss_hard += bce_loss_fn(masks[1], gt)
-                loss_hard += bce_loss_fn(masks[2], gt)
-                loss_hard = loss_hard / 3.0  # 平均
+                # === 2. DINO Loss (自蒸馏) ===
+                loss_dino = torch.tensor(0.0).to(self.device)
+                if self.use_dino:
+                    student_out = outputs['student_dino']
+                    teacher_out = outputs['teacher_dino']
 
+                    # 计算 DINO Loss
+                    loss_dino = self.dino_loss_fn(student_out, teacher_out, e)
 
-                # === 3. 组合损失 ===
-                loss = (alpha * loss_soft) + ((1 - alpha) * loss_hard)
-                self.optim.zero_grad()
-                loss.backward()
-                self.optim.step()
+                for m in masks:
+                    loss_bce += bce_loss_fn(m, gt)
+                    loss_dice += self.dice_loss_fn(m, gt)
+
+                loss_hard = (loss_bce + loss_dice) / 3.0
+
+                # 3.DIST Loss (特征关联蒸馏)
+                # loss_dist = self.calculate_distill_loss(s_feats, t_feats)
+
+                # 新增关系损失
+                loss_relation = 0.0
+                for i in range(len(s_feats)):
+                    loss_relation += self.dist_loss_fn.forward_relation(s_feats[i], t_feats[i])
+
+                # 5. Logits Loss (响应蒸馏 - Soft Label)
+                # 让学生模仿老师的最终预测概率，这能显著减少背景噪声
+                loss_logit = 0.0
+                for i in range(3):
+                    # 1. 获取学生和老师的 Logits
+                    s_logit = masks[i]
+                    t_logit = t_masks[i].detach()
+
+                    # 2. [关键修复] 将老师的 Logits 上采样到和学生一样的尺寸
+                    # 注意：s_logit.shape[-2:] 通常是 (256, 256)
+                    if s_logit.shape[-2:] != t_logit.shape[-2:]:
+                        t_logit = F.interpolate(t_logit, size=s_logit.shape[-2:], mode='bilinear', align_corners=False)
+
+                    # 3. Sigmoid 转概率
+                    s_prob = torch.sigmoid(s_logit)
+                    t_prob = torch.sigmoid(t_logit)
+
+                    # 4. 计算 MSE
+                    loss_logit += F.mse_loss(s_prob, t_prob)
+                loss_logit = loss_logit / 3.0
+
+                # 4. 总 Loss
+                alpha = self.args.distill_alpha  # 建议设为 2.0 - 5.0
+                beta = 1.0  # <--- [新增] 关系损失的权重，建议设为 1.0 或 0.5
+                gamma = 1.0
+                # loss = loss_hard + alpha * loss_vid + beta * loss_relation+ gamma * loss_logit
+                loss = loss_hard + beta * loss_relation + gamma * loss_logit + alpha * loss_dino
+
+                # 5. 反向传播与优化
+                self.optim.zero_grad()  # 清空梯度
+                loss.backward()  # 计算梯度
+                self.optim.step()  # 更新学生参数
+                # === 4. EMA 更新 Teacher ===
+                if self.use_dino:
+                    # 使用动量更新 teacher = m * teacher + (1-m) * student
+                    # m 通常从 0.996 增长到 1.0
+                    momentum = 0.996
+                    update_teacher_weights(self.model.student_backbone, self.model.teacher_backbone, momentum)
+                    update_teacher_weights(self.model.student_dino_head, self.model.teacher_dino_head, momentum)
 
                 # 记录和显示
                 epoch_loss_sum += loss.item()
-                epoch_soft += loss_soft.item()
                 epoch_hard += loss_hard.item()
+                # epoch_dist += loss_dist.item()
+                # epoch_vid += loss_vid.item()
+                epoch_relation += loss_relation.item()
+                epoch_logit += loss_logit.item()
 
                 progress_bar.set_postfix({
                     'Total': f"{loss.item():.4f}",
-                    'Soft': f"{loss_soft.item():.4f}",
-                    'Hard': f"{loss_hard.item():.4f}"
+                    'Hard': f"{loss_hard.item():.4f}",
+                    # 'VID': f"{loss_vid.item():.4f}",
+                    'Relation': f"{loss_relation.item():.4f}",
+                    'Logit': f"{loss_logit.item():.4f}",
+                    'Dino': f"{loss_dino.item():.4f}",
                 })
+
             # 计算当前 Epoch 的平均 Loss
             avg_loss = epoch_loss_sum / len(self.train_dataloader)
-            self.logger.info(f"Epoch {e+1}: Avg Loss={avg_loss:.5f} (Soft={epoch_soft/len(self.train_dataloader):.5f}, Hard={epoch_hard/len(self.train_dataloader):.5f})")
+            avg_hard = epoch_hard / len(self.train_dataloader)
+            avg_dist = epoch_dist / len(self.train_dataloader)
+            avg_relation = epoch_relation / len(self.train_dataloader)
+            avg_logit = epoch_logit / len(self.train_dataloader)
+            avg_dino = epoch_dino / len(self.train_dataloader)
+            # avg_vid = epoch_vid / len(self.train_dataloader)
+            # 记录训练历史
+            self.train_history['epochs'].append(e + 1)
+            self.train_history['avg_loss'].append(avg_loss)
+            self.train_history['hard_loss'].append(avg_hard)
+            self.train_history['dist_loss'].append(avg_dist)
+            self.train_history['relation_loss'].append(avg_relation)
+            self.train_history['logit_loss'].append(avg_logit)
+            self.train_history['dino_loss'].append(avg_dino)
+            # self.train_history['vid_loss'].append(avg_vid)
+            self.train_history['learning_rate'].append(self.optim.param_groups[0]['lr'])
+
+            # self.logger.info(f"Epoch {e+1}: Avg Loss={avg_loss:.5f} (Vid={avg_vid:.5f},Relation={avg_relation:.5f}, Hard={avg_hard:.5f}),logit={avg_logit:.5f}")
+            self.logger.info(
+                f"Epoch {e + 1}: Avg Loss={avg_loss:.5f} (Relation={avg_relation:.5f}, Hard={avg_hard:.5f}),logit={avg_logit:.5f},dino = {avg_dino:5f}")
             # 保存 Best Model 逻辑 ---
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
@@ -318,7 +454,70 @@ class Trainer(object):
             # 定期保存 Checkpoint (比如每10轮)，防止意外中断
             if (e + 1) % 10 == 0:
                 self.save_checkpoint(e, avg_loss)
-                self.save_checkpoint(e, avg_loss)
+        # 训练结束后
+        self.plot_training_history()
+
+    def plot_training_history(self):
+        """绘制训练历史图表"""
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')  # 用于服务器环境，不显示图形界面
+
+        epochs = self.train_history['epochs']
+
+        # 创建图形
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+        # 1. 总损失曲线
+        axes[0, 0].plot(epochs, self.train_history['avg_loss'], 'b-', label='Total Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Total Training Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # 2. 分解损失曲线
+        axes[0, 1].plot(epochs, self.train_history['hard_loss'], 'r-', label='Hard Loss')
+        axes[0, 1].plot(epochs, self.train_history['dist_loss'], 'g-', label='Dist Loss')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_title('Loss Components')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # 3. 对数坐标的损失曲线（更容易看出下降趋势）
+        axes[1, 0].semilogy(epochs, self.train_history['avg_loss'], 'b-', label='Total Loss')
+        axes[1, 0].semilogy(epochs, self.train_history['hard_loss'], 'r--', label='Hard Loss')
+        axes[1, 0].semilogy(epochs, self.train_history['dist_loss'], 'g--', label='Dist Loss')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss (log scale)')
+        axes[1, 0].set_title('Loss with Log Scale')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # 4. 学习率变化
+        axes[1, 1].plot(epochs, self.train_history['learning_rate'], 'purple', label='Learning Rate')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Learning Rate')
+        axes[1, 1].set_title('Learning Rate Schedule')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # 保存图像
+        plot_path = os.path.join(self.model_save_path, 'training_history.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        self.logger.info(f'Training history plot saved to {plot_path}')
+
+        # 同时保存数据到文件
+        import json
+        history_path = os.path.join(self.model_save_path, 'training_history.json')
+        with open(history_path, 'w') as f:
+            json.dump(self.train_history, f, indent=2)
+        self.logger.info(f'Training history data saved to {history_path}')
 
     def save_student_model(self, filename):
         """专门用于保存纯净的学生模型权重"""
@@ -342,6 +541,7 @@ class Trainer(object):
             'state_dict': self.model.state_dict(),
             'optimizer': self.optim.state_dict(),
         }, save_path)
+
     def val_phase(self, epoch, type):
         f1_train = self.evaluator_train.Pixel_F1_score()
         oa_train = self.evaluator_train.Pixel_Accuracy()
@@ -355,11 +555,12 @@ class Trainer(object):
         self.evaluator_train.reset()
         self.logger.info(
             'Epoch:[{}/{}]  train_Pre={:.4f}  train_Rec={:.4f}  train_OA={:.4f}  train_F1={:.4f}  train_IoU={:.4f}  train_KC={:.4f}  best_F1_train:[{:.4f}/{}]'.format(
-                epoch + 1, self.epoch, pre_train, rec_train, oa_train, f1_train, iou_train, kc_train, self.best_f1_train,
+                epoch + 1, self.epoch, pre_train, rec_train, oa_train, f1_train, iou_train, kc_train,
+                self.best_f1_train,
                 self.best_epoch_train))
 
         self.model.eval()
-        rec, pre, oa, f1_score, iou, kc = self.validation(type)
+        rec, pre, oa, f1_score, iou, kc, _ = self.validation(type)
 
         if f1_score > self.best_f1:
             torch.save(self.model.state_dict(),
@@ -384,6 +585,11 @@ class Trainer(object):
 
     def validation(self, type):
         self.evaluator.reset()
+
+        # 添加损失计算
+        total_loss = 0.0
+        criterion = torch.nn.BCEWithLogitsLoss()
+
         if type == 'val':
             data_loader = self.val_dataloader
         elif type == 'test':
@@ -398,243 +604,117 @@ class Trainer(object):
                 post_img = post_img.to(self.device).float()
                 label = gt.unsqueeze(dim=1).to(self.device).float()
 
-                output, output2, output3 = self.model(pre_img, post_img)
+                # 修改为返回所有输出
+                outputs = self.model(pre_img, post_img)
+                if isinstance(outputs, dict):
+                    output = outputs.get('masks', [None])[0]
+                else:
+                    output, output2, output3 = outputs
+                    output = output  # 取第一个尺度
+
+                # 计算验证损失
+                loss = criterion(output, label)
+                total_loss += loss.item()
+
+                # 原始评估代码
                 pred = torch.where(output > 0.5, torch.ones_like(output), torch.zeros_like(output)).long()
-
                 pred = pred.cpu().numpy()
-                label = label.cpu().numpy()
-                self.evaluator.add_batch(label, pred)
+                label_np = label.cpu().numpy()
+                self.evaluator.add_batch(label_np, pred)
 
+        # 返回评估指标和损失
         f1_score = self.evaluator.Pixel_F1_score()
         oa = self.evaluator.Pixel_Accuracy()
         rec = self.evaluator.Pixel_Recall_Rate()
         pre = self.evaluator.Pixel_Precision_Rate()
         iou = self.evaluator.Intersection_over_Union()
         kc = self.evaluator.Kappa_coefficient()
-        return rec, pre, oa, f1_score, iou, kc
+
+        avg_val_loss = total_loss / len(data_loader)
+
+        return rec, pre, oa, f1_score, iou, kc, avg_val_loss
 
     def test(self):
-        print("----------Starting Test with Converted Weights!----------")
+        print("----------Starting Test (Student Only)----------")
 
-        # 1. 定义路径
-        # 优先寻找 save_student_model 保存的纯权重
+        # 1. 寻找权重文件
+        # 优先找纯学生权重，没有则找包含老师的权重
         best_ckpt_path = os.path.join(self.model_save_path, 'best_student_model.pth')
-        # 如果找不到，回退到 best_model.pth
         if not os.path.exists(best_ckpt_path):
             best_ckpt_path = os.path.join(self.model_save_path, 'best_model.pth')
 
-        # 定义转换后的输出路径
-        converted_ckpt_path = os.path.join(self.model_save_path, 'deploy_student_model.pth')
-
-        # 2. 执行模型转换 (瘦身 + 重命名)
-        if os.path.exists(best_ckpt_path):
-            print(f"[Auto-Convert] Converting {best_ckpt_path} -> {converted_ckpt_path} ...")
-            try:
-                # 调用 conver_stu.py 中的函数
-                convert_checkpoint(best_ckpt_path, converted_ckpt_path)
-            except Exception as e:
-                print(f"Error during conversion: {e}")
-                return
-        else:
-            print(f"Error: Source checkpoint {best_ckpt_path} not found.")
+        if not os.path.exists(best_ckpt_path):
+            print(f"Error: Checkpoint not found at {best_ckpt_path}")
             return
 
-        # 3. 加载转换后的权重
-        print(f"[Auto-Test] Loading converted weights from: {converted_ckpt_path}")
+        print(f"Loading weights from: {best_ckpt_path}")
+
         try:
-            checkpoint = torch.load(converted_ckpt_path, map_location=self.device)
-            # 处理可能存在的 'state_dict' 嵌套
+            # 2. 加载权重
+            checkpoint = torch.load(best_ckpt_path, map_location=self.device)
             state_dict = checkpoint['state_dict'] if isinstance(checkpoint,
                                                                 dict) and 'state_dict' in checkpoint else checkpoint
 
-            # === 关键步骤：键名临时映射 ===
-            # 转换后的权重是 'backbone.xxx'，但当前内存中的模型 (FlickCD) 依然叫 'student_backbone.xxx'
-            # 我们需要把名字改回去才能加载进 FlickCD 进行测试
+            # 3. [关键步骤] 剔除 Teacher 权重，只保留 Student
             new_state_dict = {}
+            cleaned_count = 0
+
             for k, v in state_dict.items():
-                if k.startswith('backbone.'):
+                # A. 遇到 'teacher_' 开头的 key，直接丢弃
+                if 'teacher_' in k:
+                    cleaned_count += 1
+                    continue
+
+                # B. 保留 Student 权重
+                # 处理一下可能的 key 前缀不匹配问题 (比如训练时叫 student_backbone，这里也叫 student_backbone)
+                # 你的模型里叫 student_backbone, ucm, decoder
+
+                # 如果权重文件里有 student_backbone 前缀，直接用
+                if k.startswith('student_backbone.') or k.startswith('ucm.') or k.startswith('decoder.'):
+                    new_state_dict[k] = v
+
+                # 如果权重文件里是 backbone (可能来自其他脚本转换)，改名为 student_backbone
+                elif k.startswith('backbone.'):
                     new_key = k.replace('backbone.', 'student_backbone.')
                     new_state_dict[new_key] = v
+
+                # 如果是 features 开头 (纯 backbone 权重)，加上 student_backbone 前缀
+                elif k.startswith('features.'):
+                    new_key = 'student_backbone.' + k
+                    new_state_dict[new_key] = v
+
                 else:
                     new_state_dict[k] = v
 
-            # 4. 加载到模型
-            # strict=False 是必须的，因为转换后的权重删除了 teacher_backbone，
-            # 而 FlickCD 代码里还有 teacher 定义，会导致 keys missing，这是正常的。
-            missing_keys, unexpected_keys = self.model.load_state_dict(new_state_dict, strict=False)
+            print(f"   -> Ignored {cleaned_count} teacher keys.")
+            print(f"   -> Loading {len(new_state_dict)} student keys.")
 
-            print(f"Weights loaded successfully.")
-            # 过滤掉 teacher 相关的 missing key 打印，只关注真正的错误
-            real_missing = [k for k in missing_keys if not k.startswith('teacher_backbone')]
+            # 4. 加载到模型 (strict=False 允许模型里没有 teacher 权重)
+            # 这里的 self.model 是 FlickCD 实例
+            missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
+
+            # 检查真正丢失的 Student 权重 (排除掉 teacher)
+            real_missing = [k for k in missing if 'teacher_' not in k]
             if len(real_missing) > 0:
-                print(f"Warning: Real missing keys: {real_missing}")
+                print(f"[Warning] Real student keys missing: {real_missing[:5]} ...")
+            else:
+                print(">>> Student weights loaded PERFECTLY!")
 
         except Exception as e:
-            print(f"Failed to load converted weights: {e}")
+            print(f"Failed to load weights: {e}")
             return
 
         # 5. 开始验证
         self.model.eval()
-        # 确保 teacher 也是 eval 模式 (虽然没加载权重，但以防万一)
-        if hasattr(self.model, 'teacher_backbone'):
-            self.model.teacher_backbone.eval()
 
-        rec, pre, oa, f1_score, iou, kc = self.validation(type='test')
+        # 在 validation 函数里，不需要 return_all=True，也不需要 batch_idx
+        # 我们需要在 Trainer 类里确认 validation 函数是怎么调用的
+        rec, pre, oa, f1_score, iou, kc, _ = self.validation(type='test')
 
         self.logger.info(
-            'Test (Converted)\t Pre={:.4f}\t Rec:{:.4f}\t OA={:.4f}\t F1={:.4f}\t IoU={:.4f}\t KC={:.4f}'.format(
+            'Test Result:\t Pre={:.4f}\t Rec:{:.4f}\t OA={:.4f}\t F1={:.4f}\t IoU={:.4f}\t KC={:.4f}'.format(
                 pre, rec, oa, f1_score, iou, kc))
 
-    # def test(self):
-    #     print("---------- Testing Deploy Final (Corrected) ----------")
-    #
-    #     # 1. 路径设置
-    #     ckpt_path = os.path.join(self.model_save_path, 'deploy_final.pth')
-    #     if not os.path.exists(ckpt_path):
-    #         print(f"Error: 找不到文件 {ckpt_path}")
-    #         return
-    #
-    #     print(f"=> Loading Deploy Weights: {ckpt_path}")
-    #     state_dict = torch.load(ckpt_path, map_location=self.device)
-    #
-    #     # 2. [关键步骤 A] 调整模型结构 (Switch to Deploy)
-    #     # 必须先将内存中的 Student 切换为单分支结构，才能匹配权重
-    #     print("=> Step 1: Switching model structure to deploy mode...")
-    #     if hasattr(self.model.student_backbone, 'switch_to_deploy'):
-    #         self.model.student_backbone.switch_to_deploy()
-    #     else:
-    #         print("Error: switch_to_deploy not found! 请检查 encoder_distillation02.py")
-    #         return
-    #
-    #     # 3. [关键步骤 B] 键名映射 (backbone -> student_backbone)
-    #     print("=> Step 2: Remapping keys (backbone -> student_backbone)...")
-    #     new_state_dict = {}
-    #     for k, v in state_dict.items():
-    #         if k.startswith('backbone.'):
-    #             new_key = k.replace('backbone.', 'student_backbone.')
-    #             new_state_dict[new_key] = v
-    #         else:
-    #             new_state_dict[k] = v
-    #
-    #     # 4. 加载权重 (使用 strict=False)
-    #     print("=> Step 3: Loading state dict...")
-    #     # 【修改点】strict=False，因为我们知道 deploy_final.pth 里没有 teacher_backbone
-    #     missing_keys, unexpected_keys = self.model.load_state_dict(new_state_dict, strict=False)
-    #
-    #     # 5. 安全检查：确认缺失的仅仅是 Teacher
-    #     real_missing = [k for k in missing_keys if not k.startswith('teacher_backbone')]
-    #
-    #     if len(real_missing) > 0:
-    #         print(f"❌ 严重错误: 发现 Student 核心权重缺失!")
-    #         print(f"   缺失列表示例: {real_missing[:5]}")
-    #         print("   可能原因: repvit_m0_light 结构不匹配，或者 deploy_final.pth 损坏。")
-    #         return
-    #
-    #     if len(unexpected_keys) > 0:
-    #         print(f"❌ 严重错误: 发现多余的权重键!")
-    #         print(f"   多余列表示例: {unexpected_keys[:5]}")
-    #         return
-    #
-    #     print("✅ Weights loaded successfully (Teacher keys missing as expected).")
-    #
-    #     # 6. 开始测试
-    #     self.model.eval()
-    #     # 确保 Teacher 也是 eval 模式 (虽然它没权重且不参与计算，但为了安全)
-    #     if hasattr(self.model, 'teacher_backbone'):
-    #         self.model.teacher_backbone.eval()
-    #
-    #     print("=> Starting Evaluation...")
-    #     rec, pre, oa, f1_score, iou, kc = self.validation(type='test')
-    #
-    #     print("\n" + "=" * 50)
-    #     print(f"FINAL DEPLOY TEST RESULT")
-    #     print("=" * 50)
-    #     print(f"Precision : {pre:.4f}")
-    #     print(f"Recall    : {rec:.4f}")
-    #     print(f"F1 Score  : {f1_score:.4f}")
-    #     print(f"IoU       : {iou:.4f}")
-    #     print(f"OA        : {oa:.4f}")
-    #     print("=" * 50)
-    # def test(self):
-    #     print("---------- 最终部署导出模式 (Final Deploy & Export) ----------")
-    #
-    #     # 1. 路径设置
-    #     ckpt_path = os.path.join(self.model_save_path, 'best_student_model.pth')
-    #     if not os.path.exists(ckpt_path):
-    #         print(f"Error: {ckpt_path} 不存在!")
-    #         return
-    #
-    #     print(f"=> Loading Raw Checkpoint: {ckpt_path}")
-    #     checkpoint = torch.load(ckpt_path, map_location='cpu')
-    #     state_dict = checkpoint['state_dict'] if (
-    #                 isinstance(checkpoint, dict) and 'state_dict' in checkpoint) else checkpoint
-    #
-    #     # 2. [关键] 智能权重清洗 (复用刚才成功的逻辑)
-    #     print("=> Step 1: Cleaning weights...")
-    #     clean_state_dict = {}
-    #     for k, v in state_dict.items():
-    #         # (A) 去除 DDP 训练可能产生的 module. 前缀
-    #         if k.startswith('module.'):
-    #             k = k.replace('module.', '')
-    #
-    #         # (B) 彻底剔除 Teacher
-    #         if 'teacher_backbone' in k:
-    #             continue
-    #
-    #         # (C) 保留 Student, UCM, Decoder
-    #         clean_state_dict[k] = v
-    #
-    #     # 3. 加载到当前模型 (此时还是多分支结构)
-    #     # strict=False 是为了容忍 teacher_backbone 的缺失
-    #     self.model.load_state_dict(clean_state_dict, strict=False)
-    #     print("=> Step 2: Weights loaded successfully (Pre-Fusion).")
-    #
-    #     self.model.eval()
-    #     self.model = self.model.to(self.device)
-    #
-    #     # 4. [核心] 执行结构重参数化 (Fuse)
-    #     print("=> Step 3: Executing Structural Re-parameterization (Switch to Deploy)...")
-    #     # 这一步会把 RepVGGDW 变成 Conv2d
-    #     self.model.student_backbone.switch_to_deploy()
-    #     print("   Fusion Done. Model is now single-branch.")
-    #
-    #     # 5. 验证融合后的精度 (Double Check)
-    #     # 理论上应该保持在 0.8497 左右，允许有极微小的浮点误差
-    #     print("=> Step 4: Verifying Accuracy AFTER Fusion...")
-    #     rec, pre, oa, f1, iou, kc = self.validation(type='test')
-    #     print(f">>> Fused Model F1: {f1:.4f}")
-    #
-    #     if f1 < 0.8:
-    #         print("❌ 警告：融合后精度大幅下降！请检查 switch_to_deploy 逻辑。停止保存。")
-    #         return
-    #
-    #     # 6. [最终导出] 改名并保存
-    #     print("=> Step 5: Renaming keys and Saving final model...")
-    #
-    #     final_state_dict = self.model.state_dict()
-    #     export_state_dict = {}
-    #
-    #     for k, v in final_state_dict.items():
-    #         # 再次确保不含 teacher
-    #         if 'teacher_backbone' in k: continue
-    #
-    #         # --- 改名核心逻辑 ---
-    #         # 将 student_backbone.xxx 改为 backbone.xxx
-    #         if k.startswith('student_backbone.'):
-    #             new_key = k.replace('student_backbone.', 'backbone.')
-    #             export_state_dict[new_key] = v
-    #         else:
-    #             # ucm 和 decoder 保持原样
-    #             export_state_dict[k] = v
-    #
-    #     save_name = 'deploy_final.pth'
-    #     save_path = os.path.join(self.model_save_path, save_name)
-    #     torch.save(export_state_dict, save_path)
-    #
-    #     print(f"\n✅ Success! 最终部署模型已保存至: {save_path}")
-    #     print("   - 已去除 Teacher")
-    #     print("   - 已完成结构重参数化 (Fuse)")
-    #     print("   - 键名已修改: student_backbone -> backbone")
 
 def set_seed(seed):
     random.seed(seed)
@@ -645,13 +725,14 @@ def set_seed(seed):
     # torch.backends.cudnn.benchmark = False
     # torch.use_deterministic_algorithms(True)
 
+
 def main():
     parser = argparse.ArgumentParser(description="Argument for training")
     parser.add_argument('--title', type=str)
 
     # set data path
     parser.add_argument('--data_name', type=str, default='LEVIR+')
-    parser.add_argument('--train_dataset_path', type=str,default='./dataset/train/')
+    parser.add_argument('--train_dataset_path', type=str, default='./dataset/train/')
     parser.add_argument('--train_list_path', type=str)
     parser.add_argument('--train_name_list', type=list)
     parser.add_argument('--val_dataset_path', type=str)
@@ -662,7 +743,7 @@ def main():
     parser.add_argument('--test_name_list', type=list)
     parser.add_argument('--resume', type=str)
     parser.add_argument('--savedir', default='./result/', type=str)
-    
+
     # Choose GPU
     parser.add_argument('--gpu_id', type=int, default=0)
 
@@ -678,7 +759,7 @@ def main():
 
     # 添加蒸馏相关参数
     parser.add_argument('--use_distillation', action='store_true', default=False)
-    parser.add_argument('--distill_alpha', type=float, default=0.7)
+    parser.add_argument('--distill_alpha', type=float, default=0.2)
     parser.add_argument('--temperature', type=float, default=3.0)
 
     args = parser.parse_args()
@@ -700,6 +781,7 @@ def main():
     if args.mode == 'train':
         trainer.training()
     trainer.test()
+
 
 if __name__ == "__main__":
     main()

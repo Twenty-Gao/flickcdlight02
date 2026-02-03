@@ -125,7 +125,7 @@ def run_inference():
 
     # 保存结果
     result_img = Image.fromarray(pred_binary)
-    result_img.save("inference_result.png")
+    result_img.save("result_image/infrence/inference_result.png")
     print("Result saved to inference_result.png")
 
 

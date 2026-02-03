@@ -140,7 +140,7 @@ if __name__ == "__main__":
     img_path = './dataset/train/T1/train_1.png'
 
     # 3. 结果保存路径
-    save_path = './student_vis_result.png'
+    save_path = './result_image/vis_result/student_vis_result.png'
     # ===========================================
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

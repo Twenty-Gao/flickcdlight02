@@ -144,7 +144,7 @@ class RepViTBlock(nn.Module):
 # 如果满足，则 self.identity 为 True，后续可能会启用残差连接。
         self.identity = stride == 1 and inp == oup
         #断言检查：确保中间隐藏层维度 hidden_dim 是输入维度 inp 的两倍。
-        assert(hidden_dim == 2 * inp)
+        # assert(hidden_dim == 2 * inp)
 #开始判断分支：如果步长大于1（这里是等于2），则进入这个分支处理下采样情况。
         if stride == 2:
             # 深度可分离卷积、SE注意力分数，处理空间信息
@@ -194,6 +194,29 @@ class RepViTBlock(nn.Module):
 
     def forward(self, x):
         return self.channel_mixer(self.token_mixer(x))
+# [新增] 核心重参数化逻辑
+    def switch_to_deploy(self):
+        # 1. 融合 Token Mixer (处理 RepVGGDW 和 Conv2d_BN)
+        for i, layer in enumerate(self.token_mixer):
+            if hasattr(layer, 'fuse'):
+                # 如果是 RepVGGDW，fuse() 会返回一个单层 Conv2d
+                # 如果是 Conv2d_BN，fuse() 也会返回一个单层 Conv2d
+                self.token_mixer[i] = layer.fuse()
+
+        # 2. 融合 Channel Mixer (处理内部的 Conv2d_BN)
+        # 注意：channel_mixer 是 Residual(Sequential(...))
+        # 你的 Residual.fuse() 逻辑比较简单，可能无法处理 Sequential 的内部融合
+        # 所以我们这里手动深入一层去融合 Sequential 里的 Conv2d_BN
+        if isinstance(self.channel_mixer.m, nn.Sequential):
+            for i, layer in enumerate(self.channel_mixer.m):
+                if hasattr(layer, 'fuse'):
+                    self.channel_mixer.m[i] = layer.fuse()
+
+        # 尝试融合最外层的 Residual 结构 (如果有必要且 Residual.fuse 支持)
+        if hasattr(self.channel_mixer, 'fuse'):
+            # 如果 Residual.fuse 能处理，它会返回融合后的结果
+            # 但针对目前的结构，保留 Residual 包装通常更安全，只要内部卷积融合了即可
+            pass
 
 # BN_Linear 是一个组合模块，将批归一化（BatchNorm1d）和线性层（Linear）结合在一起
 class BN_Linear(torch.nn.Sequential):
@@ -486,23 +509,95 @@ class RepViT(nn.Module):
         #     self.features 现在包含了整个网络的所有层(包括patch嵌入层和所有的 RepViTBlock 层)。
         self.features = nn.ModuleList(layers)
 
+        self.deploy = False
+
+    # def forward(self, x):
+    #     output = []
+    #     for idx, f in enumerate(self.features):
+    #         x = f(x)
+    #         output.append(x)
+    #
+    #     # 打印输入维度
+    #     print(f"\nInput shape: {x.shape if 'x' in locals() else 'N/A'}")
+    #
+    #     # 你的代码中原本的逻辑：
+    #     if len(self.features) < 15:  # 认为是 student
+    #         final_outputs = output[1], output[3], output[-1]
+    #
+    #         print(f"Student model (len(features)={len(self.features)}) output shapes:")
+    #         for i, (idx, out_tensor) in enumerate(zip([1, 3, -1], final_outputs)):
+    #             batch, channels, height, width = out_tensor.shape
+    #             layer_info = f"output[{idx}]" if idx >= 0 else "output[-1]"
+    #             print(f"  Stage {i} ({layer_info}): {out_tensor.shape}")
+    #             print(f"    Batch: {batch}, Channels: {channels}, HxW: {height}x{width}")
+    #
+    #         return final_outputs
+    #     else:  # 认为是 teacher (repvit_m0)
+    #         final_outputs = output[2], output[5], output[-1]
+    #
+    #         print(f"Teacher model (len(features)={len(self.features)}) output shapes:")
+    #         for i, (idx, out_tensor) in enumerate(zip([2, 5, -1], final_outputs)):
+    #             batch, channels, height, width = out_tensor.shape
+    #             layer_info = f"output[{idx}]" if idx >= 0 else "output[-1]"
+    #             print(f"  Stage {i} ({layer_info}): {out_tensor.shape}")
+    #             print(f"    Batch: {batch}, Channels: {channels}, HxW: {height}x{width}")
+    #
+    #         return final_outputs
+
+    # 将此方法替换 encoder_distillation02.py 中 RepViT 类的 forward 方法
     def forward(self, x):
         output = []
+        stage_outputs = []
+
         for idx, f in enumerate(self.features):
             x = f(x)
             output.append(x)
 
-        # 你的代码中原本的逻辑：
-        if len(self.features) < 15:  # 认为是 student
-            # 这里的索引必须对应上面 cfgs 中每个 Stage 的最后一行
-            # 根据我上面的 cfgs:
-            # Output[1] 是 40通道 (Stage 0)
-            # Output[4] 是 80通道 (Stage 1)
-            # Output[-1] 是 160通道 (Stage 2)
-            return output[1], output[3], output[-1]
-        else:  # 认为是 teacher (repvit_m0)
-            # m0 的索引通常是 [2, 5, -1] 或者类似的，请保持原样
-            return output[2], output[5], output[-1]
+            is_last_layer = (idx == len(self.features) - 1)
+            if not is_last_layer:
+                next_cfg = self.cfgs[idx]
+                if next_cfg[-1] == 2:
+                    stage_outputs.append(x)
+            else:
+                stage_outputs.append(x)
+
+        # 获取最终要返回的输出
+        if len(stage_outputs) >= 3:
+            final_outputs = stage_outputs[0], stage_outputs[1], stage_outputs[2]
+        else:
+            final_outputs = (
+                output[1] if len(output) > 1 else output[-1],
+                output[3] if len(output) > 3 else output[-1],
+                output[-1]
+            )
+
+        # 打印维度
+        # print(f"Forward output shapes:")
+        # for i, out_tensor in enumerate(final_outputs):
+        #     print(f"  Output {i + 1}: {out_tensor.shape}")
+
+        return final_outputs
+    # [新增] 全局一键部署函数
+    def switch_to_deploy(self):
+        if self.deploy:
+            print("Model already in deploy mode.")
+            return
+
+        print("RepViT: Switching to deploy mode (fusing weights)...")
+
+        for module in self.features:
+            # 1. 处理 Patch Embed (它是一个 Sequential)
+            if isinstance(module, nn.Sequential):
+                for i, layer in enumerate(module):
+                    if hasattr(layer, 'fuse'):
+                        module[i] = layer.fuse()
+
+            # 2. 处理 RepViTBlock
+            elif hasattr(module, 'switch_to_deploy'):
+                module.switch_to_deploy()
+
+        self.deploy = True
+        print("RepViT: Structure re-parameterization done.")
 # We define a new version of RepViT for FlickCD
 # The Difference between repvit_m0 and repvit_m0_6 is whether the 4th stage exists.
 # 预定义模型变体
@@ -538,7 +633,63 @@ def repvit_student02(pretrained=False, num_classes=1000, distillation=False):
     return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
 
 
+def repvit_student03(pretrained=False, num_classes=1000, distillation=False):
+    """
+    [极小模型] 比 student02 更小。
+    策略：
+    1. 深度保持极简 (与 student02 一样，每个 Stage 2层)。
+    2. 膨胀系数 (t) 从 2 降为 1。这会大幅减少块内部的计算量。
+    3. 通道数保持 (40, 80, 160)，方便蒸馏对齐。
+    """
+    cfgs = [
+        # k, t, c, SE, HS, s
+        # t (expand ratio) 全部设为 1 (原为 2)
+
+        # --- Stage 0 (40 channels) ---
+        [3, 1, 40, 1, 0, 1],
+        [3, 1, 40, 0, 0, 1],  # Index 1 -> Output[1]
+
+        # --- Stage 1 (80 channels) ---
+        [3, 1, 80, 0, 0, 2],
+        [3, 1, 80, 1, 0, 1],  # Index 3 -> Output[3]
+
+        # --- Stage 2 (160 channels) ---
+        [3, 1, 160, 0, 1, 2],
+        [3, 1, 160, 1, 1, 1],  # Index 5 -> Output[-1]
+    ]
+    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
 # 在 encoder_distillation03.py 中修改或替换 repvit_student
+
+
+def repvit_m0_light(pretrained=False, num_classes=1000, distillation=False):
+    """
+    [轻量版 m0] 比 m0 小一点点。
+    策略：
+    1. 削减最深层 Stage 2 的层数 (从 10 层减为 6 层)。
+    2. Stage 0 和 Stage 1 保持与 m0 完全一致，保留浅层特征提取能力。
+    """
+    cfgs = [
+        # k, t, c, SE, HS, s
+
+        # --- Stage 0 (保持 m0 原样) ---
+        [3, 2, 40, 1, 0, 1],
+        [3, 2, 40, 0, 0, 1],
+
+        # --- Stage 1 (保持 m0 原样) ---
+        [3, 2, 80, 0, 0, 2],
+        [3, 2, 80, 1, 0, 1],
+        [3, 2, 80, 0, 0, 1],
+
+        # --- Stage 2 (减负: 10层 -> 6层) ---
+        [3, 2, 160, 0, 1, 2],  # Downsample
+        [3, 2, 160, 1, 1, 1],
+        [3, 2, 160, 0, 1, 1],
+        [3, 2, 160, 1, 1, 1],
+        [3, 2, 160, 0, 1, 1],
+        [3, 2, 160, 1, 1, 1],  # 结束
+    ]
+    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+
 
 def repvit_student01(pretrained=False, num_classes=1000, distillation=False):
     """
@@ -571,6 +722,39 @@ def repvit_student01(pretrained=False, num_classes=1000, distillation=False):
     ]
     return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
 
+
+def repvit_m0_lighter(pretrained=False, num_classes=1000, distillation=False):
+    """
+    [更轻量版 m0] 比 m0_light 更小一点。
+    结构对比:
+    m0       : Stage2 = 15+ 层
+    m0_light : Stage2 = 6 层
+    m0_lighter: Stage2 = 4 层  <-- 本模型
+    student01: Stage2 = 3 层
+
+    策略：
+    Stage 0 (2层) 和 Stage 1 (3层) 保持不变，仅削减 Stage 2 的深度。
+    """
+    cfgs = [
+        # k, t, c, SE, HS, s
+
+        # --- Stage 0 (40 channels, 2层) ---
+        [3, 2, 40, 1, 0, 1],
+        [3, 2, 40, 0, 0, 1],
+
+        # --- Stage 1 (80 channels, 3层) ---
+        [3, 2, 80, 0, 0, 2],
+        [3, 2, 80, 1, 0, 1],
+        [3, 2, 80, 0, 0, 1],
+
+        # --- Stage 2 (160 channels, 4层) ---
+        # 相比 m0_light 的 6 层，这里减少到 4 层
+        [3, 2, 160, 0, 1, 2],  # Downsample
+        [3, 2, 160, 1, 1, 1],
+        [3, 2, 160, 0, 1, 1],
+        [3, 2, 160, 1, 1, 1],  # 结束 (Index 8)
+    ]
+    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
 
 def repvit_m0(pretrained=False, num_classes = 1000, distillation=False):
     cfgs = [
@@ -721,7 +905,6 @@ def repvit_m1_1(pretrained=False, num_classes = 1000, distillation=False):
         [3,   2, 512, 0, 1, 1]
     ]
     return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
-
 
 
 def repvit_m1_5(pretrained=False, num_classes = 1000, distillation=False):
