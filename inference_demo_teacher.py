@@ -7,36 +7,43 @@ import cv2
 from PIL import Image
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-("  生成学生模型的特征图和结果图")
-# --- 1. 导入学生模型组件 ---
-from model.encoder_distillation03 import repvit_student02
+("  生成教师模型的特征图和结果图")
+# --- 1. 导入模型组件 ---
+# 请确保这些路径与你的项目结构一致
+from model.encoder_distillation03 import repvit_m0
 from model.decoder_distillation03 import EnhancedDiffModule, Decoder
 
 
-# --- 2. 定义学生推理模型类 ---
-class FlickCD_Student_Inference(nn.Module):
+# --- 2. 定义教师推理模型类 ---
+class FlickCD_Teacher_Inference(nn.Module):
     def __init__(self, window_size=(4, 8, 8), stride=(4, 8, 8)):
-        super(FlickCD_Student_Inference, self).__init__()
-        # 使用对应的学生 Backbone
-        self.backbone = repvit_student02()
+        super(FlickCD_Teacher_Inference, self).__init__()
+        # 实例化教师 Backbone
+        self.backbone = repvit_m0()
         self.dim = 80
         self.ucm = EnhancedDiffModule([40, 80, 160], self.dim)
         self.decoder = Decoder(self.dim, window_size, stride)
 
     def forward(self, t1, t2, return_features=False):
+        # 提取 Stage 特征
         s1_feats = list(self.backbone(t1))
         s2_feats = list(self.backbone(t2))
+
+        # 提取 UCM 差异增强特征 (Scale 0, 1, 2)
         u1, u2, u3 = self.ucm(s1_feats[0], s1_feats[1], s1_feats[2],
                               s2_feats[0], s2_feats[1], s2_feats[2])
+
+        # 解码得到预测图
         mask1, mask2, mask3 = self.decoder(u1, u2, u3)
         mask1_up = F.interpolate(mask1, scale_factor=4, mode='bilinear')
         pred = torch.sigmoid(mask1_up)
+
         if return_features:
+            # 返回预测图、Backbone特征、以及UCM差异特征
             return pred, (s1_feats, s2_feats), (u1, u2, u3)
+
         return pred
 
-
-# --- 3. 可视化辅助函数 (与教师版完全一致) ---
 
 def tensor_to_rgb_img(t, mean=[0.406, 0.456, 0.485], std=[0.225, 0.224, 0.229]):
     """还原归一化后的 tensor 为 RGB 图像 (numpy)"""
@@ -119,43 +126,52 @@ def plot_seven_results(t1_tensor, t2_tensor, gt_np, final_mask_np, stage_t1, sta
     plt.close()
     print(f"Combined visualization saved to {save_path}")
 
-
-# --- 5. 推理逻辑 ---
-def run_student_inference():
+# --- 5. 推理主逻辑 ---
+def run_teacher_inference():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 依然从 Experiment 50 的 pth 中提取学生权重
-    model_path = './result/LEVIR_CD_Experiment_distillation50/best_student_model.pth'
-    save_dir = "result_image/inference_student"
+    # 权重路径：根据你的描述，这里存放的是 backbone/ucm/decoder 结构的权重
+    model_path = './model/best_model.pth'
+    save_dir = "result_image/inference_teacher"
     os.makedirs(save_dir, exist_ok=True)
 
+    # 数据路径
     img_id = "10198"
     img_t1_path = f'/home/workstation/Dataset/LEVIR-CD+/test/T1/{img_id}.png'
     img_t2_path = f'/home/workstation/Dataset/LEVIR-CD+/test/T2/{img_id}.png'
     img_gt_path = f'/home/workstation/Dataset/LEVIR-CD+/test/GT/{img_id}.png'
+    # img_t1_path = f'./dataset/LEVIR-CD+/test/T1/{img_id}.png'
+    # img_t2_path = f'./dataset/LEVIR-CD+/test/T2/{img_id}.png'
+    # img_gt_path = f'./dataset/LEVIR-CD+/test/GT/{img_id}.png'
+    # 1. 初始化模型
+    model = FlickCD_Teacher_Inference().to(device)
 
-    model = FlickCD_Student_Inference().to(device)
-
+    # 2. 加载权重 (修正后的逻辑)
     if os.path.exists(model_path):
         print(f"Loading weights from {model_path}...")
         checkpoint = torch.load(model_path, map_location=device)
         state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
 
+        # 直接清理前缀，不再寻找 'teacher_'
         new_state_dict = {}
         for k, v in state_dict.items():
-            if 'teacher_' in k: continue  # 排除教师部分
-            name = k.replace('module.', '')
-            # 兼容 student_backbone -> backbone 的映射
-            if name.startswith('student_backbone.'):
-                name = name.replace('student_backbone.', 'backbone.')
+            name = k.replace('module.', '')  # 移除 DataParallel 前缀
             new_state_dict[name] = v
 
-        model.load_state_dict(new_state_dict, strict=False)
+        # 加载到模型中
+        model.load_state_dict(new_state_dict, strict=True)
+        print("Weights loaded successfully.")
+
+        # 转换为推理模式（融合 BN 层等）
         if hasattr(model.backbone, 'switch_to_deploy'):
             model.backbone.switch_to_deploy()
+    else:
+        print(f"Error: No weight found at {model_path}")
+        return
 
     model.eval()
 
+    # 3. 图像预处理
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
@@ -164,17 +180,31 @@ def run_student_inference():
 
     t1_tensor = transform(Image.open(img_t1_path).convert('RGB')).unsqueeze(0).to(device)
     t2_tensor = transform(Image.open(img_t2_path).convert('RGB')).unsqueeze(0).to(device)
-    gt_np = np.array(Image.open(img_gt_path).convert('L').resize((256, 256))) if os.path.exists(
-        img_gt_path) else np.zeros((256, 256))
 
-    print("Running student inference...")
+    if os.path.exists(img_gt_path):
+        gt_np = np.array(Image.open(img_gt_path).convert('L').resize((256, 256)))
+    else:
+        gt_np = np.zeros((256, 256), dtype=np.uint8)
+
+    # 4. 执行推理并获取特征
+    print("Running teacher inference...")
     with torch.no_grad():
         pred_mask, (s1_fs, s2_fs), (u_fs) = model(t1_tensor, t2_tensor, return_features=True)
 
+    # 5. 结果处理与绘图
     final_mask_np = (pred_mask.squeeze().cpu().numpy() > 0.5).astype('uint8') * 255
-    plot_seven_results(t1_tensor, t2_tensor, gt_np, final_mask_np, s1_fs[0], s2_fs[0], u_fs[0],
-                       os.path.join(save_dir, f"student_results_{img_id}_synced.png"))
+
+    # 提取第 0 阶段的特征
+    stage_t1_s0 = s1_fs[0]
+    stage_t2_s0 = s2_fs[0]
+    ucm_diff_s0 = u_fs[0]
+
+    plot_seven_results(
+        t1_tensor, t2_tensor, gt_np, final_mask_np,
+        stage_t1_s0, stage_t2_s0, ucm_diff_s0,
+        os.path.join(save_dir, f"teacher_results_{img_id}_pre2.png")
+    )
 
 
 if __name__ == '__main__':
-    run_student_inference()
+    run_teacher_inference()

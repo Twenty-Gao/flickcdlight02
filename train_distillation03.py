@@ -206,42 +206,6 @@ class Trainer(object):
                 # teacher_temp=0.07,
             ).to(self.device)
 
-    def calculate_distill_loss(self, s_feats_list, t_feats_list):
-        """
-        计算多尺度 DIST Loss
-        """
-        loss_dist_total = 0.0
-        num_scales = len(s_feats_list)
-
-        # 1. 对可学习参数进行 Softmax，确保它们和为 1 且为正
-        # 这样模型就在学习“分配比例”
-        current_weights = F.softmax(self.learnable_weights, dim=0)
-        # 打印一下当前的权重，方便你观察训练过程中权重的变化（可选）
-        # print(f"Current Distill Weights: {current_weights.detach().cpu().numpy()}")
-        # [修复逻辑] 自动扩展权重
-        # 因为 s_feats_list 包含了 T1 和 T2 两张图的特征 (3 + 3 = 6)
-        # 所以我们需要把权重复制一份：[0.2, 0.3, 0.5, 0.2, 0.3, 0.5]
-        # 2. 逻辑适配：因为你有双时相 (T1, T2) 共 6 层，需要把权重复制一份
-        if num_scales == 2 * len(current_weights):
-            # 变成 [w0, w1, w2, w0, w1, w2]
-            scale_weights = torch.cat([current_weights, current_weights], dim=0)
-        elif num_scales == len(current_weights):
-            scale_weights = current_weights
-        else:
-            # 兜底逻辑
-            scale_weights = current_weights
-
-        for i in range(num_scales):
-            s_f = s_feats_list[i]
-            t_f = t_feats_list[i]
-
-            loss_layer = self.dist_loss_fn(s_f, t_f)
-
-            # 累加加权 Loss
-            loss_dist_total += loss_layer * scale_weights[i]
-
-        # 返回平均 Loss
-        return loss_dist_total / num_scales
 
     def training(self):
         # 打印训练方法名
@@ -457,6 +421,44 @@ class Trainer(object):
         # 训练结束后
         self.plot_training_history()
 
+
+    def calculate_distill_loss(self, s_feats_list, t_feats_list):
+        """
+        计算多尺度 DIST Loss
+        """
+        loss_dist_total = 0.0
+        num_scales = len(s_feats_list)
+
+        # 1. 对可学习参数进行 Softmax，确保它们和为 1 且为正
+        # 这样模型就在学习“分配比例”
+        current_weights = F.softmax(self.learnable_weights, dim=0)
+        # 打印一下当前的权重，方便你观察训练过程中权重的变化（可选）
+        # print(f"Current Distill Weights: {current_weights.detach().cpu().numpy()}")
+        # [修复逻辑] 自动扩展权重
+        # 因为 s_feats_list 包含了 T1 和 T2 两张图的特征 (3 + 3 = 6)
+        # 所以我们需要把权重复制一份：[0.2, 0.3, 0.5, 0.2, 0.3, 0.5]
+        # 2. 逻辑适配：因为你有双时相 (T1, T2) 共 6 层，需要把权重复制一份
+        if num_scales == 2 * len(current_weights):
+            # 变成 [w0, w1, w2, w0, w1, w2]
+            scale_weights = torch.cat([current_weights, current_weights], dim=0)
+        elif num_scales == len(current_weights):
+            scale_weights = current_weights
+        else:
+            # 兜底逻辑
+            scale_weights = current_weights
+
+        for i in range(num_scales):
+            s_f = s_feats_list[i]
+            t_f = t_feats_list[i]
+
+            loss_layer = self.dist_loss_fn(s_f, t_f)
+
+            # 累加加权 Loss
+            loss_dist_total += loss_layer * scale_weights[i]
+
+        # 返回平均 Loss
+        return loss_dist_total / num_scales
+
     def plot_training_history(self):
         """绘制训练历史图表"""
         import matplotlib.pyplot as plt
@@ -585,16 +587,17 @@ class Trainer(object):
 
     def validation(self, type):
         self.evaluator.reset()
-
-        # 添加损失计算
         total_loss = 0.0
         criterion = torch.nn.BCEWithLogitsLoss()
+
 
         if type == 'val':
             data_loader = self.val_dataloader
         elif type == 'test':
             data_loader = self.test_dataloader
 
+
+        is_test_mode = (type == 'test')
         torch.cuda.empty_cache()
 
         with torch.no_grad():
@@ -604,13 +607,21 @@ class Trainer(object):
                 post_img = post_img.to(self.device).float()
                 label = gt.unsqueeze(dim=1).to(self.device).float()
 
-                # 修改为返回所有输出
-                outputs = self.model(pre_img, post_img)
-                if isinstance(outputs, dict):
-                    output = outputs.get('masks', [None])[0]
+                # 对前5个batch进行可视化
+                do_visualize = is_test_mode and (iter < 5)
+
+                outputs = self.model(
+                    pre_img,
+                    post_img,
+                    gt = label,
+                    visualize=do_visualize,
+                    batch_idx=iter,
+                    save_dir=os.path.join('./result_image/test_vis')
+                )
+                if isinstance(outputs, tuple):
+                    output = outputs[0]  # 获取第一个尺度的 Sigmoid 预测值
                 else:
-                    output, output2, output3 = outputs
-                    output = output  # 取第一个尺度
+                    output = outputs.get('masks', [None])[0]
 
                 # 计算验证损失
                 loss = criterion(output, label)

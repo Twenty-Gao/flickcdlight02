@@ -317,9 +317,8 @@ class FlickCD(nn.Module):
 
 
 
-    def forward(self, t1, t2, return_all=False, batch_idx=0, save_dir="./result_image/vis_results"):
+    def forward(self, t1, t2,gt=None, return_all=False, batch_idx=0, save_dir="./result_image/vis_results", visualize=False):
         # --- 1. 学生前向 ---
-        # print(batch_idx)
         s1_feats = list(self.student_backbone(t1))
         s2_feats = list(self.student_backbone(t2))
 
@@ -327,53 +326,37 @@ class FlickCD(nn.Module):
         stage1, stage2, stage3 = self.ucm(s1_feats[0], s1_feats[1], s1_feats[2],
                                           s2_feats[0], s2_feats[1], s2_feats[2])
         mask1, mask2, mask3 = self.decoder(stage1, stage2, stage3)
-
-        if hasattr(self, 'teacher_backbone'):
+        # --- 3. 教师推理 (仅在需要时运行) ---
+        t_outputs = None
+        if hasattr(self, 'teacher_backbone') and (return_all or visualize):
             with torch.no_grad():
                 # 1. 显式运行 Teacher 推理
-                t1_feats = list(self.teacher_backbone(t1))
-                t2_feats = list(self.teacher_backbone(t2))
-
-                t_stage1, t_stage2, t_stage3 = self.teacher_ucm(
-                    t1_feats[0], t1_feats[1], t1_feats[2],
-                    t2_feats[0], t2_feats[1], t2_feats[2]
-                )
-                t_mask1, t_mask2, t_mask3 = self.teacher_decoder(t_stage1, t_stage2, t_stage3)
+                t1_f = list(self.teacher_backbone(t1))
+                t2_f = list(self.teacher_backbone(t2))
+                t_s1, t_s2, t_s3 = self.teacher_ucm(t1_f[0], t1_f[1], t1_f[2], t2_f[0], t2_f[1], t2_f[2])
+                t_m1, t_m2, t_m3 = self.teacher_decoder(t_s1, t_s2, t_s3)
+                t_masks = [t_m1, t_m2, t_m3]
+                t_stages = [t_s1, t_s2, t_s3]
 
         # =========== [可视化模块：同时保存学生和老师] ===========
-        # 仅在5个batch执行
-        if batch_idx < 5:
-            print(f"[DEBUG] 执行可视化，batch_idx={batch_idx}")
-            # --- A. 画学生 (Student) ---
-            stages = [stage1, stage2, stage3]
-            masks = [mask1, mask2, mask3]
-            for i in range(3):
-                self.visualize_6_col(
-                    t1, t2,
-                    s1_feats[i],  # Student T1 Feat
-                    s2_feats[i],  # Student T2 Feat
-                    stages[i],  # Student Stage
-                    masks[i],  # Student Pred (Mask)
-                    save_name=f"vis_batch_{batch_idx}_stage{i + 1}_STUDENT.png",
+        if visualize:
+            s_masks = [mask1, mask2, mask3]
+            s_stages = [stage1, stage2, stage3]
+            for i in range(1):
+                # 保存学生预测结果
+                self.visualize_7_col(
+                    t1, t2, gt, s1_feats[i], s2_feats[i], s_stages[i], s_masks[i],
+                    save_name=f"test_batch_{batch_idx}_stage{i + 1}_STUDENT.png",
                     save_dir=save_dir
                 )
-
-            # --- B. 画老师 (Teacher) ---
-            if hasattr(self, 'teacher_backbone'):
-                with torch.no_grad():
-                    t_stages = [t_stage1, t_stage2, t_stage3]
-                    t_masks = [t_mask1, t_mask2, t_mask3]
-
-                    for i in range(3):
-                        self.visualize_6_col(
-                            t1, t2,
-                            t1_feats[i],  # Teacher T1 Feat
-                            t2_feats[i],  # Teacher T2 Feat
-                            t_stages[i],  # Teacher Stage
-                            t_masks[i],  # Teacher Pred (Mask)
-                            save_name=f"vis_batch_{batch_idx}_stage{i + 1}_TEACHER.png",
-                            save_dir=save_dir
-                        )
+                # 如果有老师，保存对比图
+                if t_outputs:
+                    self.visualize_7_col(
+                        t1, t2, gt, t_outputs['feats'][i], t_outputs['feats'][i + 3],
+                        t_outputs['stages'][i], t_outputs['masks'][i],
+                        save_name=f"test_batch_{batch_idx}_stage{i + 1}_TEACHER.png",
+                        save_dir=save_dir
+                    )
 
 
         # 如果只是普通推理 (测试/验证)，直接返回结果
@@ -395,82 +378,77 @@ class FlickCD(nn.Module):
             return {
                 'masks': [mask1, mask2, mask3],
                 's_feats': s1_feats + s2_feats,
-                't_feats': t1_feats + t2_feats,
+                't_feats': t1_f + t2_f,
                 's_stages': [stage1, stage2, stage3],
-                't_stages': [t_stage1, t_stage2, t_stage3],
-                't_masks': [t_mask1, t_mask2, t_mask3]
+                't_stages': [t_s1, t_s2, t_s3],
+                't_masks': [t_m1, t_m2, t_m3]
             }
 
         return torch.sigmoid(mask1), torch.sigmoid(mask2), torch.sigmoid(mask3)
 
 
         # 添加到 FlickCD 类中
-    def visualize_6_col(self, t1, t2, feat1, feat2, diff, pred, save_name, save_dir="./vis_results"):
-            """
-            生成 6 列对比图：T1 | T2 | Feat1 | Feat2 | Diff | Mask
-            """
-            import matplotlib.pyplot as plt
-            import numpy as np
-            import os
-            import cv2
 
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
+    def visualize_7_col(self, t1, t2, gt, feat1, feat2, diff, pred, save_name, save_dir):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+        import cv2
 
-            # === 辅助函数 (保持不变) ===
-            def tensor_to_img(t, mode='rgb'):
-                img = t[0].detach().cpu()
-                if mode == 'rgb':
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    img = img * std + mean
-                    img = torch.clamp(img, 0, 1)
-                    img = img.permute(1, 2, 0).numpy()
-                    return img
-                elif mode == 'heatmap':
-                    if img.dim() == 3: img = torch.mean(img, dim=0)
-                    img = img.numpy()
-                    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-                    img = np.uint8(255 * img)
-                    heatmap = cv2.applyColorMap(img, cv2.COLORMAP_JET)
-                    return cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-                elif mode == 'mask':
-                    if img.dim() == 3: img = img[0]
-                    img = torch.sigmoid(img).numpy()
-                    img = np.uint8(255 * img)
-                    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
 
-            # 1. 转换数据
-            img_t1 = tensor_to_img(t1, mode='rgb')
-            img_t2 = tensor_to_img(t2, mode='rgb')
-            img_feat1 = tensor_to_img(feat1, mode='heatmap')  # T1 特征
-            img_feat2 = tensor_to_img(feat2, mode='heatmap')  # T2 特征 (新增)
-            img_diff = tensor_to_img(diff, mode='heatmap')
-            img_pred = tensor_to_img(pred, mode='mask')
+        def tensor_to_img(t, mode='rgb'):
+            if t is None: return None
+            img = t[0].detach().cpu()
+            if mode == 'rgb':
+                # 必须与 Trainer 中的 mean/std 匹配 (此处假设为 BGR 顺序)
+                mean = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+                std = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
+                img = img * std + mean
+                img = torch.clamp(img, 0, 1).permute(1, 2, 0).numpy()
+                return img
+            elif mode == 'heatmap':
+                if img.dim() == 3: img = torch.mean(img, dim=0)
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                return cv2.cvtColor(cv2.applyColorMap(np.uint8(255 * img), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+            elif mode == 'mask':
+                if img.dim() == 3: img = img[0]
+                # 如果是 logits 则做 sigmoid，如果是 prob 则保持
+                if img.max() > 1.0 or img.min() < 0.0:
+                    img = torch.sigmoid(img)
+                img = np.uint8(255 * img.numpy())
+                return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif mode == 'gt':
+                if img.dim() == 3: img = img[0]
+                # GT 是 0/1，转为 0/255
+                img = np.uint8(255 * torch.clamp(img, 0, 1).numpy())
+                return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-            # 2. 统一尺寸
-            h, w = img_t1.shape[:2]
-            img_t2 = cv2.resize(img_t2, (w, h))
-            img_feat1 = cv2.resize(img_feat1, (w, h))
-            img_feat2 = cv2.resize(img_feat2, (w, h))
-            img_diff = cv2.resize(img_diff, (w, h))
-            img_pred = cv2.resize(img_pred, (w, h))
+        img_t1 = tensor_to_img(t1, 'rgb')
+        img_t2 = tensor_to_img(t2, 'rgb')
+        img_gt = tensor_to_img(gt, 'gt')
+        img_feat1 = tensor_to_img(feat1, 'heatmap')
+        img_feat2 = tensor_to_img(feat2, 'heatmap')
+        img_diff = tensor_to_img(diff, 'heatmap')
+        img_pred = tensor_to_img(pred, 'mask')
 
-            # 3. 绘图 (1行6列)
-            fig, axes = plt.subplots(1, 6, figsize=(30, 5))  # 宽度增加到 30
+        h, w = img_t1.shape[:2]
+        # 如果 GT 为空，创建一个黑图占位
+        if img_gt is None: img_gt = np.zeros((h, w, 3), dtype=np.uint8)
 
-            titles = ["Pre (T1)", "Post (T2)", "Feat (T1)", "Feat (T2)", "Diff (Stage)", "Pred (Mask)"]
-            images = [img_t1, img_t2, img_feat1, img_feat2, img_diff, img_pred]
+        fig, axes = plt.subplots(1, 7, figsize=(35, 5))
+        images = [img_t1, img_t2, img_gt, img_feat1, img_feat2, img_diff, img_pred]
+        titles = ["Pre (T1)", "Post (T2)", "Ground Truth", "Feat1", "Feat2", "Diff", "Prediction"]
 
-            for ax, img, title in zip(axes, images, titles):
-                ax.imshow(img)
-                ax.set_title(title)
-                ax.axis('off')
+        for ax, img, title in zip(axes, images, titles):
+            ax.imshow(cv2.resize(img, (w, h)))
+            ax.set_title(title)
+            ax.axis('off')
 
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, save_name))
-            plt.close()
-
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, save_name), dpi=150)
+        plt.close()
 
     def _inherit_student_weights(self):
         """
