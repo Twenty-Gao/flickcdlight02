@@ -1,1 +1,2 @@
-ssh -p 53609 root@10.63.9.1
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate /root/miniconda3/envs/FlickCD

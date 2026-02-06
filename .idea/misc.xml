@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="lightCD" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Remote /root/miniconda3/envs/FlickCD (sftp://root@10.63.9.1:53609null)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="53609" project-jdk-type="Python SDK" />
 </project>

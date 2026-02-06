@@ -72,6 +72,10 @@ python train.py \
     --test_list_path "./dataset/SYSU/SYSU/test.txt" \
     --savedir "./result/"
 
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate /root/miniconda3/envs/FlickCD
+
+
   python train_distillation04.py \
     --mode train \
     --title "LEVIR_CD_Experiment_distillation50" \
